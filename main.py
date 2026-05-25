@@ -3,6 +3,7 @@ import re
 import time
 import sys
 import os
+import platform
 from bs4 import BeautifulSoup
 
 try:
@@ -14,7 +15,19 @@ except ImportError:
 # ─── CONFIG ───────────────────────────────────────────────────
 UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
 UA_MOBILE  = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36'
-OUT_DIR    = "/storage/emulated/0/Enon"
+
+# ─── OS DETECTION ─────────────────────────────────────────────
+def get_out_dir():
+    # Android (Termux)
+    if os.path.exists('/storage/emulated/0'):
+        return '/storage/emulated/0/Anon'
+    # Windows
+    if platform.system() == 'Windows':
+        return os.path.join(os.path.expanduser('~'), 'Downloads', 'Anon')
+    # Mac/Linux
+    return os.path.join(os.path.expanduser('~'), 'Downloads', 'Anon')
+
+OUT_DIR = get_out_dir()
 
 # ─── SESSION FACTORIES ────────────────────────────────────────
 def make_session(mobile=False):
@@ -143,6 +156,26 @@ def resolve_streamtape(url, session):
         print(f"  [!] Streamtape: {e}")
         return None
 
+def resolve_vidmoly(embed_url, session):
+    try:
+        session.headers.update({
+            'User-Agent': UA_DESKTOP,
+            'Referer': 'https://myasiantv9.com.ro/'
+        })
+        r = safe_get(session, embed_url)
+        if not r:
+            return None
+        m3u8 = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', r.text)
+        if m3u8:
+            return m3u8[0]
+        mp4 = re.findall(r'https?://[^\s"\'<>]+\.mp4[^\s"\'<>]*', r.text)
+        if mp4:
+            return mp4[0]
+        return None
+    except Exception as e:
+        print(f"  [!] Vidmoly: {e}")
+        return None
+
 def resolve_vidbasic(embed_url, session):
     BLOCKED_HOSTS = ['asianload', 'dood', 'streamvid']
     PREFERRED_HOSTS = ['watchadsontape.com', 'streamtape']
@@ -183,6 +216,18 @@ def resolve_vidbasic(embed_url, session):
             print(f"  [!] Vidbasic attempt {attempt+1}: {e}")
             time.sleep(3)
     return None
+
+def resolve_embed(src, session):
+    """Route embed URL to the correct resolver, with generic fallback."""
+    if 'vidmoly' in src:
+        return resolve_vidmoly(src, session)
+    elif 'vidbasic' in src:
+        return resolve_vidbasic(src, session)
+    else:
+        # Generic fallback for any new embed host
+        print(f"    [>] Unknown embed host, trying generic extract: {src[:60]}...")
+        r = safe_get(session, src)
+        return find_direct_video(r.text) if r else None
 
 def resolve_drip_waffi(url, session):
     try:
@@ -372,14 +417,15 @@ def extract_myasiantv(url, session):
         r = safe_get(session, ep_url, timeout=30)
         if r:
             soup = BeautifulSoup(r.text, 'html.parser')
-            iframe = soup.find('iframe', src=re.compile(r'vidbasic'))
+            # Find any iframe — vidbasic, vidmoly, or other
+            iframe = soup.find('iframe', src=re.compile(r'vidbasic|vidmoly'))
             if not iframe:
                 iframe = soup.find('iframe', src=True)
             if iframe:
                 src = iframe.get('src', '')
                 if not src.startswith('http'):
                     src = 'https:' + src
-                direct = resolve_vidbasic(src, session)
+                direct = resolve_embed(src, session)
             else:
                 print(f"  [!] No iframe found")
         if direct:
@@ -470,14 +516,14 @@ def retry_failed(filepath, session):
                 r = safe_get(session, ep_url, timeout=30)
                 if r:
                     soup = BeautifulSoup(r.text, 'html.parser')
-                    iframe = soup.find('iframe', src=re.compile(r'vidbasic'))
+                    iframe = soup.find('iframe', src=re.compile(r'vidbasic|vidmoly'))
                     if not iframe:
                         iframe = soup.find('iframe', src=True)
                     if iframe:
                         src = iframe.get('src', '')
                         if not src.startswith('http'):
                             src = 'https:' + src
-                        direct = resolve_vidbasic(src, session)
+                        direct = resolve_embed(src, session)
             elif 'np-downloader.com' in ep_url:
                 session.headers.update({'Referer': 'https://www.naijaprey.tv/'})
                 r = safe_get(session, ep_url)
@@ -528,9 +574,10 @@ def save_results(links, name):
     with open(filepath, 'w') as f:
         f.write('\n'.join(links))
     print(f"\n[✓] Saved {len(links)} link(s) to: {filepath}")
+    print(f"[✓] Location: {filepath}")
     failed = sum(1 for l in links if l.startswith('# FAILED'))
     if failed:
-        print(f"[!] {failed} failed — type 'retry' next time to fix them")
+        print(f"[!] {failed} failed — type 'retry' to fix them")
     return filepath
 
 # ─── MAIN ─────────────────────────────────────────────────────
@@ -555,9 +602,10 @@ def main():
             print("[!] No links extracted.")
         return
 
-    # Interactive loop — open Termux and just paste links forever
+    # Interactive loop — open Termux/terminal and just paste links forever
     print("=" * 50)
     print("  DOWNLOAD TOOLKIT")
+    print(f"  Saving to: {OUT_DIR}")
     print("=" * 50)
     print("Supported sites:")
     for domain in SITE_MAP:
