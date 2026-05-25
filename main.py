@@ -631,29 +631,36 @@ def save_results(links, name):
 
 # ─── MAIN ─────────────────────────────────────────────────────
 def main():
-    if len(sys.argv) < 2:
+    session = make_session()
+
+    # Retry mode via argument: python main.py retry "/path/to/file.txt"
+    if len(sys.argv) >= 2 and sys.argv[1].lower() == 'retry':
+        if len(sys.argv) < 3:
+            filepath = input("Enter path to .txt file: ").strip()
+        else:
+            filepath = sys.argv[2]
+        retry_failed(filepath, session)
+        return
+
+    # URL passed as argument
+    if len(sys.argv) >= 2:
+        url = sys.argv[1].strip()
+    else:
+        # Interactive mode — just paste the link
         print("=" * 50)
         print("  DOWNLOAD TOOLKIT")
         print("=" * 50)
-        print("\nUsage:")
-        print("  download \"URL\"")
-        print("  download retry \"/path/to/Series.txt\"")
         print("\nSupported sites:")
         for domain in SITE_MAP:
             print(f"  • {domain}")
-        print("=" * 50)
-        sys.exit(1)
+        print("\nPaste link and press Enter (or type 'retry' to retry failed links):")
+        url = input("> ").strip()
 
-    session = make_session()
+        if url.lower() == 'retry':
+            filepath = input("Enter path to .txt file: ").strip()
+            retry_failed(filepath, session)
+            return
 
-    if sys.argv[1].lower() == 'retry':
-        if len(sys.argv) < 3:
-            print("[!] Usage: download retry \"/path/to/file.txt\"")
-            sys.exit(1)
-        retry_failed(sys.argv[2], session)
-        return
-
-    url = sys.argv[1].strip()
     extractor = detect_site(url)
 
     if not extractor:
