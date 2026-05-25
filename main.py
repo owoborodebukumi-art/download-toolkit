@@ -42,14 +42,10 @@ def safe_get(session, url, timeout=20, referer=None, retries=3):
     return None
 
 def find_direct_video(text):
-    """Find direct video URL, stripping trailing junk characters."""
     for ext in [r'\.m3u8', r'\.mp4', r'\.mkv']:
-        # Stop at any quote, space, angle bracket, comma, or backslash
         found = re.findall(r'https?://[^\s"\'<>,\\]+' + ext + r'[^\s"\'<>,\\]*', text)
         if found:
-            # Extra strip of any lingering punctuation
-            url = found[0].rstrip('.,;)')
-            return url
+            return found[0].rstrip('.,;)')
     return None
 
 def clean_name(slug):
@@ -60,7 +56,6 @@ def clean_name(slug):
 # ─── FILE HOST RESOLVERS ──────────────────────────────────────
 
 def resolve_downloadwella(url, session):
-    """XFileSharing POST method - downloadwella.com"""
     try:
         r = safe_get(session, url, timeout=20)
         if not r:
@@ -72,7 +67,6 @@ def resolve_downloadwella(url, session):
         data = {inp.get('name'): inp.get('value', '')
                 for inp in form.find_all('input') if inp.get('name')}
         data['method_free'] = 'Free Download'
-        # Fixed: added explicit timeout to POST
         r2 = session.post(url, data=data, timeout=20)
         return find_direct_video(r2.text)
     except Exception as e:
@@ -80,7 +74,6 @@ def resolve_downloadwella(url, session):
         return None
 
 def resolve_loadedfiles(url, session):
-    """3-step pt token method - loadedfiles.org"""
     try:
         session.headers.update({'Referer': 'https://9jarocks.net/'})
         r1 = safe_get(session, url)
@@ -103,7 +96,6 @@ def resolve_loadedfiles(url, session):
         return None
 
 def resolve_wildshare(url):
-    """PT token method - wildshare.net (requires curl_cffi)"""
     if not HAS_CURL_CFFI:
         print("  [!] Wildshare requires curl_cffi — install it: pip install curl_cffi")
         return None
@@ -115,9 +107,7 @@ def resolve_wildshare(url):
         pt = re.search(r'pt=([A-Za-z0-9%+=/]+)', r.text)
         if not pt:
             return None
-        # Fixed: more reliable file ID extraction
         parts = url.rstrip('/').split('/')
-        # Remove any file extension segment to get clean ID
         file_id = next((p for p in reversed(parts) if not p.endswith(('.mkv', '.mp4', '.m3u8'))), parts[-1])
         pt_url = f'https://wildshare.net/{file_id}?{pt.group(0)}'
         r2 = s.get(pt_url, timeout=20, allow_redirects=False)
@@ -127,14 +117,11 @@ def resolve_wildshare(url):
         return None
 
 def resolve_streamtape(url, session):
-    """Substring chain method - watchadsontape.com"""
     try:
         session.headers.update({'Referer': 'https://watchadsontape.com/'})
         r = safe_get(session, url)
         if not r or r.status_code == 404:
             return None
-
-        # Try pattern 1: innerHTML assignment with substring
         for line in r.text.split('\n'):
             if "getElementById('robotlink')" in line and 'substring' in line:
                 m = re.search(r"innerHTML\s*=\s*'([^']+)'\s*\+\s*\('([^']+)'\)", line.strip())
@@ -147,12 +134,9 @@ def resolve_streamtape(url, session):
                     loc = r2.headers.get('location')
                     if loc:
                         return loc
-
-        # Fallback pattern 2: direct video link in page
         v = find_direct_video(r.text)
         if v:
             return v
-
         print("  [!] Streamtape: no pattern matched")
         return None
     except Exception as e:
@@ -160,32 +144,21 @@ def resolve_streamtape(url, session):
         return None
 
 def resolve_vidbasic(embed_url, session):
-    """Try all vidbasic servers with proper filtering."""
     BLOCKED_HOSTS = ['asianload', 'dood', 'streamvid']
     PREFERRED_HOSTS = ['watchadsontape.com', 'streamtape']
-
     for attempt in range(2):
         try:
-            session.headers.update({
-                'User-Agent': UA_DESKTOP,
-                'Referer': 'https://myasiantv9.com.ro/'
-            })
+            session.headers.update({'User-Agent': UA_DESKTOP, 'Referer': 'https://myasiantv9.com.ro/'})
             r = safe_get(session, embed_url)
             if not r:
                 continue
-
-            # Fixed: only grab absolute data-video URLs from this domain's player
             raw_servers = re.findall(r'data-video="(https?://[^"]+)"', r.text)
             servers = [u for u in raw_servers if not any(h in u for h in BLOCKED_HOSTS)]
-
             if not servers:
-                print(f"  [!] No usable servers found in embed (attempt {attempt+1})")
+                print(f"  [!] No usable servers found (attempt {attempt+1})")
                 time.sleep(3)
                 continue
-
-            # Try preferred hosts first
             ordered = sorted(servers, key=lambda u: 0 if any(h in u for h in PREFERRED_HOSTS) else 1)
-
             for sv_url in ordered:
                 print(f"    [>] Trying: {sv_url[:60]}...")
                 if 'watchadsontape.com' in sv_url or 'streamtape' in sv_url:
@@ -203,19 +176,15 @@ def resolve_vidbasic(embed_url, session):
                     except Exception as e:
                         print(f"    [!] Server error: {e}")
                         continue
-
-            # Last resort: direct video in embed page itself
             v = find_direct_video(r.text)
             if v:
                 return v
-
         except Exception as e:
             print(f"  [!] Vidbasic attempt {attempt+1}: {e}")
             time.sleep(3)
     return None
 
 def resolve_drip_waffi(url, session):
-    """Resolve dramarain download page to direct drip.waffi.cloud link"""
     try:
         r = safe_get(session, url, referer='https://dramarain.com/')
         if not r:
@@ -238,18 +207,15 @@ def extract_nkiri(url, session):
     name = re.sub(r'-s\d+.*$', '', slug, flags=re.IGNORECASE)
     name = clean_name(name)
     print(f"[*] Series: {name}")
-
     r = safe_get(session, url)
     if not r:
         return [], name
-
     soup = BeautifulSoup(r.text, 'html.parser')
     links = list(dict.fromkeys(
         a['href'] for a in soup.find_all('a', href=True)
         if 'downloadwella.com' in a['href']
     ))
     print(f"[*] Found {len(links)} episode(s)")
-
     saved = []
     for i, ep_url in enumerate(links, 1):
         ep_name = ep_url.split('/')[-1].replace('.html', '')
@@ -262,29 +228,24 @@ def extract_nkiri(url, session):
             print(f"  [✗] Failed")
             saved.append(f"# FAILED: {ep_url}")
         time.sleep(1)
-
     return saved, name
 
 def extract_dramakey_com(url, session):
-    """dramakey.com — same structure as nkiri (downloadwella.com links)"""
     print("[*] DramaKey.com mode")
     slug = url.rstrip('/').split('/')[-1]
     name = re.sub(r'-s\d+.*$', '', slug, flags=re.IGNORECASE)
     name = re.sub(r'-(season|episode|complete).*$', '', name, flags=re.IGNORECASE)
     name = clean_name(name)
     print(f"[*] Series: {name}")
-
     r = safe_get(session, url)
     if not r:
         return [], name
-
     soup = BeautifulSoup(r.text, 'html.parser')
     links = list(dict.fromkeys(
         a['href'] for a in soup.find_all('a', href=True)
         if 'downloadwella.com' in a['href']
     ))
     print(f"[*] Found {len(links)} episode(s)")
-
     saved = []
     for i, ep_url in enumerate(links, 1):
         ep_name = ep_url.split('/')[-1].replace('.html', '')
@@ -297,7 +258,6 @@ def extract_dramakey_com(url, session):
             print(f"  [✗] Failed")
             saved.append(f"# FAILED: {ep_url}")
         time.sleep(1)
-
     return saved, name
 
 def extract_9jarocks(url, session):
@@ -306,19 +266,16 @@ def extract_9jarocks(url, session):
     name = re.sub(r'-id\d+.*$', '', slug)
     name = clean_name(name)
     print(f"[*] Title: {name}")
-
     session.headers.update({'Referer': 'https://9jarocks.net/'})
     r = safe_get(session, url)
     if not r:
         return [], name
-
     soup = BeautifulSoup(r.text, 'html.parser')
     lf_links = list(dict.fromkeys(
         a['href'] for a in soup.find_all('a', href=True)
         if 'loadedfiles.org' in a['href']
     ))
     print(f"[*] Found {len(lf_links)} file(s)")
-
     saved = []
     for i, lf_url in enumerate(lf_links, 1):
         fname = lf_url.split('/')[-1][:60]
@@ -331,7 +288,6 @@ def extract_9jarocks(url, session):
             print(f"  [✗] Failed")
             saved.append(f"# FAILED: {lf_url}")
         time.sleep(1)
-
     return saved, name
 
 def extract_naijaprey(url, session):
@@ -339,19 +295,16 @@ def extract_naijaprey(url, session):
     slug = url.rstrip('/').split('/')[-1]
     name = clean_name(slug)
     print(f"[*] Title: {name}")
-
     session.headers.update({'Referer': 'https://www.naijaprey.tv/'})
     r = safe_get(session, url)
     if not r:
         return [], name
-
     soup = BeautifulSoup(r.text, 'html.parser')
     ep_links = list(dict.fromkeys(
         a['href'] for a in soup.find_all('a', href=True)
         if 'vdl.np-downloader.com' in a['href']
     ))
     print(f"[*] Found {len(ep_links)} episode(s)")
-
     saved = []
     for i, ep_url in enumerate(ep_links, 1):
         ep_name = ep_url.rstrip('/').split('/')[-1]
@@ -362,11 +315,9 @@ def extract_naijaprey(url, session):
             if not r2:
                 saved.append(f"# FAILED: {ep_url}")
                 continue
-
             soup2 = BeautifulSoup(r2.text, 'html.parser')
             ws_url = next((a['href'] for a in soup2.find_all('a', href=True)
                           if 'wildshare.net' in a['href']), None)
-
             if ws_url:
                 direct = resolve_wildshare(ws_url)
                 if direct:
@@ -382,21 +333,17 @@ def extract_naijaprey(url, session):
             print(f"  [!] Error: {e}")
             saved.append(f"# FAILED: {ep_url}")
         time.sleep(2)
-
     return saved, name
 
 def extract_myasiantv(url, session):
-    print("[*] MyAsianTV (myasiantv9) mode")
+    print("[*] MyAsianTV mode")
     slug = url.rstrip('/').split('/')[-1]
     name = re.sub(r'-episode-\d+.*$', '', slug)
     name = re.sub(r'-\d{4}.*$', '', name)
     name = clean_name(name)
     print(f"[*] Series: {name}")
-
-    # Determine base domain for filtering
     domain_match = re.search(r'(https?://[^/]+)', url)
     base_domain = domain_match.group(1) if domain_match else ''
-
     if 'episode-' in url:
         ep_links = [url]
     else:
@@ -405,39 +352,26 @@ def extract_myasiantv(url, session):
         r = safe_get(session, url, timeout=30)
         if not r:
             return [], name
-
         soup = BeautifulSoup(r.text, 'html.parser')
-
-        # Fixed: filter strictly — only episode links from the same domain
-        # and matching the current show's slug
         show_slug = re.sub(r'-\d{4}.*$', '', slug)
         ep_links = list(dict.fromkeys(
             a['href'] for a in soup.find_all('a', href=True)
-            if (
-                'episode-' in a['href']
-                and base_domain in a['href']
-                and show_slug in a['href']
-            )
+            if ('episode-' in a['href'] and base_domain in a['href'] and show_slug in a['href'])
         ))
-
         if not ep_links:
-            print("[!] No episode links found — check show slug or page structure")
+            print("[!] No episode links found")
             return [], name
-
         ep_links.sort(key=lambda u: int(m.group(1)) if (m := re.search(r'episode-(\d+)', u)) else 0)
         print(f"[*] Found {len(ep_links)} episode(s)")
-
     saved = []
     for i, ep_url in enumerate(ep_links, 1):
         ep_name = ep_url.rstrip('/').split('/')[-1]
         print(f"[{i}/{len(ep_links)}] {ep_name}")
         direct = None
-
         session.headers.update({'Referer': base_domain + '/'})
         r = safe_get(session, ep_url, timeout=30)
         if r:
             soup = BeautifulSoup(r.text, 'html.parser')
-            # Look for vidbasic iframe first, then any iframe
             iframe = soup.find('iframe', src=re.compile(r'vidbasic'))
             if not iframe:
                 iframe = soup.find('iframe', src=True)
@@ -447,8 +381,7 @@ def extract_myasiantv(url, session):
                     src = 'https:' + src
                 direct = resolve_vidbasic(src, session)
             else:
-                print(f"  [!] No iframe found on episode page")
-
+                print(f"  [!] No iframe found")
         if direct:
             print(f"  [✓] {direct[:80]}...")
             saved.append(direct)
@@ -456,46 +389,31 @@ def extract_myasiantv(url, session):
             print(f"  [✗] Failed")
             saved.append(f"# FAILED: {ep_url}")
         time.sleep(1)
-
     return saved, name
 
 def extract_dramarain(url, session):
-    """Handles dramarain.com and dramakey.cc only — same backend"""
     site = 'DramaKey.cc' if 'dramakey.cc' in url else 'DramaRain'
     print(f"[*] {site} mode")
-
     slug = url.rstrip('/').split('/')[-1]
     name = re.sub(r'-(chinese|korean|thai|japanese|drama|tvshows|movies?).*$', '', slug, flags=re.IGNORECASE)
     name = clean_name(name)
     print(f"[*] Title: {name}")
-
     session.headers.update({'Referer': url})
     r = safe_get(session, url)
     if not r:
         return [], name
-
     soup = BeautifulSoup(r.text, 'html.parser')
     saved = []
-
-    # Method 1: Direct drip.waffi.cloud links in page
     drip_links = [(a.text.strip(), a['href']) for a in soup.find_all('a', href=True)
                   if 'drip.waffi.cloud' in a['href']]
-
     if drip_links:
         print(f"[*] Found {len(drip_links)} direct link(s)")
         for label, link in drip_links:
             print(f"  [✓] {label[:40]}")
             saved.append(link)
         return saved, name
-
-    # Method 2: Download page links (window.location.href redirect)
-    # Fixed: removed dramakey.cc/download — that site now has its own extractor
     dl_links = [(a.text.strip(), a['href']) for a in soup.find_all('a', href=True)
-                if any(x in a['href'] for x in [
-                    'dramarain.com/download',
-                    'drip.waffi.cloud'
-                ])]
-
+                if any(x in a['href'] for x in ['dramarain.com/download', 'drip.waffi.cloud'])]
     if dl_links:
         print(f"[*] Found {len(dl_links)} episode(s)")
         for i, (label, dl_url) in enumerate(dl_links, 1):
@@ -513,11 +431,9 @@ def extract_dramarain(url, session):
                     saved.append(f"# FAILED: {dl_url}")
             time.sleep(0.5)
         return saved, name
-
-    # Diagnostic: show what links ARE on the page if nothing matched
     all_links = [a['href'] for a in soup.find_all('a', href=True)]
     print(f"[!] No download links found. Page has {len(all_links)} total links.")
-    print(f"[!] Sample links: {all_links[:5]}")
+    print(f"[!] Sample: {all_links[:5]}")
     return [], name
 
 # ─── RETRY ────────────────────────────────────────────────────
@@ -526,29 +442,24 @@ def retry_failed(filepath, session):
     if not os.path.exists(filepath):
         print(f"[!] File not found: {filepath}")
         return
-
     with open(filepath, 'r') as f:
         lines = [l.strip() for l in f.readlines()]
-
     updated = []
     retried = fixed = 0
-
     for line in lines:
         if not line.startswith('# FAILED:'):
             updated.append(line)
             continue
-
         ep_url = line.replace('# FAILED: ', '').strip()
         retried += 1
         print(f"[*] {ep_url.rstrip('/').split('/')[-1][:60]}")
         direct = None
-
         try:
             if 'wildshare.net' in ep_url:
                 direct = resolve_wildshare(ep_url)
             elif 'loadedfiles.org' in ep_url:
                 direct = resolve_loadedfiles(ep_url, session)
-            elif 'downloadwella.com' in ep_url:
+            elif 'downloadwella.com' in ep_url or 'dramakey.com' in ep_url:
                 direct = resolve_downloadwella(ep_url, session)
             elif 'dramarain.com/download' in ep_url:
                 direct = resolve_drip_waffi(ep_url, session)
@@ -576,12 +487,8 @@ def retry_failed(filepath, session):
                               if 'wildshare.net' in a['href']), None)
                     if ws:
                         direct = resolve_wildshare(ws)
-            # Fixed: added dramakey.com retry support
-            elif 'dramakey.com' in ep_url:
-                direct = resolve_downloadwella(ep_url, session)
         except Exception as e:
             print(f"  [!] Error: {e}")
-
         if direct:
             print(f"  [✓] Fixed")
             updated.append(direct)
@@ -589,25 +496,22 @@ def retry_failed(filepath, session):
         else:
             print(f"  [✗] Still failed")
             updated.append(line)
-
     with open(filepath, 'w') as f:
         f.write('\n'.join(updated))
-
     print(f"\n[✓] Fixed {fixed}/{retried}")
     print(f"[✓] Updated: {filepath}")
 
 # ─── SITE DETECTION ───────────────────────────────────────────
-# Fixed: more specific domains first to avoid substring collision
 SITE_MAP = {
-    'thenkiri.com':       extract_nkiri,
-    'nkiri.com':          extract_nkiri,
-    'dramakey.com':       extract_dramakey_com,   # NEW
-    'dramakey.cc':        extract_dramarain,       # kept with dramarain
-    'dramarain.com':      extract_dramarain,
-    '9jarocks.net':       extract_9jarocks,
-    'naijaprey.tv':       extract_naijaprey,
-    'myasiantv9.com.ro':  extract_myasiantv,       # more specific first
-    'myasiantv9.com':     extract_myasiantv,
+    'thenkiri.com':      extract_nkiri,
+    'nkiri.com':         extract_nkiri,
+    'dramakey.com':      extract_dramakey_com,
+    'dramakey.cc':       extract_dramarain,
+    'dramarain.com':     extract_dramarain,
+    '9jarocks.net':      extract_9jarocks,
+    'naijaprey.tv':      extract_naijaprey,
+    'myasiantv9.com.ro': extract_myasiantv,
+    'myasiantv9.com':    extract_myasiantv,
 }
 
 def detect_site(url):
@@ -626,57 +530,70 @@ def save_results(links, name):
     print(f"\n[✓] Saved {len(links)} link(s) to: {filepath}")
     failed = sum(1 for l in links if l.startswith('# FAILED'))
     if failed:
-        print(f"[!] {failed} failed — run: download retry \"{filepath}\"")
+        print(f"[!] {failed} failed — type 'retry' next time to fix them")
     return filepath
 
 # ─── MAIN ─────────────────────────────────────────────────────
 def main():
     session = make_session()
 
-    # Retry mode via argument: python main.py retry "/path/to/file.txt"
-    if len(sys.argv) >= 2 and sys.argv[1].lower() == 'retry':
-        if len(sys.argv) < 3:
-            filepath = input("Enter path to .txt file: ").strip()
-        else:
-            filepath = sys.argv[2]
-        retry_failed(filepath, session)
-        return
-
-    # URL passed as argument
+    # Non-interactive mode: python main.py "URL"
     if len(sys.argv) >= 2:
-        url = sys.argv[1].strip()
-    else:
-        # Interactive mode — just paste the link
-        print("=" * 50)
-        print("  DOWNLOAD TOOLKIT")
-        print("=" * 50)
-        print("\nSupported sites:")
-        for domain in SITE_MAP:
-            print(f"  • {domain}")
-        print("\nPaste link and press Enter (or type 'retry' to retry failed links):")
-        url = input("> ").strip()
-
-        if url.lower() == 'retry':
-            filepath = input("Enter path to .txt file: ").strip()
+        if sys.argv[1].lower() == 'retry':
+            filepath = sys.argv[2] if len(sys.argv) >= 3 else input("Enter path to .txt file: ").strip()
             retry_failed(filepath, session)
             return
+        url = sys.argv[1].strip()
+        extractor = detect_site(url)
+        if not extractor:
+            print(f"[!] Unsupported site: {url}")
+            sys.exit(1)
+        links, name = extractor(url, session)
+        if links:
+            save_results(links, name)
+        else:
+            print("[!] No links extracted.")
+        return
 
-    extractor = detect_site(url)
+    # Interactive loop — open Termux and just paste links forever
+    print("=" * 50)
+    print("  DOWNLOAD TOOLKIT")
+    print("=" * 50)
+    print("Supported sites:")
+    for domain in SITE_MAP:
+        print(f"  • {domain}")
+    print("\nCommands: paste a link | 'retry' | 'exit'")
 
-    if not extractor:
-        print(f"[!] Unsupported site: {url}")
-        print("\nSupported sites:")
-        for domain in SITE_MAP:
-            print(f"  • {domain}")
-        sys.exit(1)
+    while True:
+        print("\n> Paste link:")
+        try:
+            url = input().strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye!")
+            break
 
-    links, name = extractor(url, session)
+        if not url:
+            continue
 
-    if not links:
-        print("[!] No links extracted.")
-        sys.exit(1)
+        if url.lower() == 'exit':
+            print("Bye!")
+            break
 
-    save_results(links, name)
+        if url.lower() == 'retry':
+            filepath = input("Path to .txt file: ").strip()
+            retry_failed(filepath, session)
+            continue
+
+        extractor = detect_site(url)
+        if not extractor:
+            print(f"[!] Unsupported site. Supported: {', '.join(SITE_MAP.keys())}")
+            continue
+
+        links, name = extractor(url, session)
+        if links:
+            save_results(links, name)
+        else:
+            print("[!] No links extracted.")
 
 if __name__ == '__main__':
     main()
