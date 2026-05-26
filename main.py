@@ -20,39 +20,31 @@ UA_MOBILE  = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like
 
 # ─── OS DETECTION ─────────────────────────────────────────────
 IS_ANDROID = os.path.exists('/storage/emulated/0')
+BASE_DIR   = '/storage/emulated/0/Anon' if IS_ANDROID else os.path.join(os.path.expanduser('~'), 'Downloads', 'Anon')
 
-def get_base_dir():
-    if IS_ANDROID:
-        return '/storage/emulated/0/Anon'
-    if platform.system() == 'Windows':
-        return os.path.join(os.path.expanduser('~'), 'Downloads', 'Anon')
-    return os.path.join(os.path.expanduser('~'), 'Downloads', 'Anon')
-
-BASE_DIR = get_base_dir()
+# ─── TOOL AVAILABILITY (cached at startup) ────────────────────
+HAS_ARIA2C = shutil.which('aria2c') is not None
+HAS_YTDLP  = shutil.which('yt-dlp') is not None
+HAS_FFMPEG = shutil.which('ffmpeg') is not None
 
 # ─── ANDROID SETUP ────────────────────────────────────────────
 def setup_android():
-    """Enable wake lock and ensure we're inside tmux on Android."""
     if not IS_ANDROID:
         return
-
-    # Enable wake lock to prevent CPU/network sleep
     if shutil.which('termux-wake-lock'):
         try:
             subprocess.Popen(['termux-wake-lock'],
-                           stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
             print("[✓] Wake lock enabled — screen can go off safely")
         except Exception:
             pass
     else:
         print("[!] termux-wake-lock not found — install with: pkg install termux-api")
 
-    # Auto-start inside tmux if not already inside
     if not os.environ.get('TMUX'):
         if shutil.which('tmux'):
             print("[*] Starting persistent tmux session...")
-            # Re-launch this script inside tmux
             os.execvp('tmux', ['tmux', 'new-session', '-A', '-s', 'download',
                                sys.executable] + sys.argv)
         else:
@@ -67,7 +59,7 @@ QUALITY_MAP = {
     '4': ('1080p', 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'),
 }
 SELECTED_QUALITY = ('480p', 'bestvideo[height<=480]+bestaudio/best[height<=480]')
-QUALITY_ASKED = False
+QUALITY_ASKED    = False
 
 def ask_quality():
     global SELECTED_QUALITY
@@ -86,11 +78,9 @@ def ask_quality():
             break
         print("[!] Enter 1, 2, 3 or 4")
 
-# ─── ARIA2C CHECK ─────────────────────────────────────────────
-def has_aria2c():
-    return shutil.which('aria2c') is not None
-
+# ─── TOOL INSTALLERS ──────────────────────────────────────────
 def install_aria2c():
+    global HAS_ARIA2C
     print("[*] Installing aria2...")
     try:
         if IS_ANDROID:
@@ -100,27 +90,26 @@ def install_aria2c():
             return False
         else:
             subprocess.run(['sudo', 'apt', 'install', 'aria2', '-y'], check=True)
+        HAS_ARIA2C = True
         print("[✓] aria2 installed")
         return True
     except Exception as e:
         print(f"[!] Failed to install aria2: {e}")
         return False
 
-# ─── YTDLP CHECK ──────────────────────────────────────────────
-def has_ytdlp():
-    return shutil.which('yt-dlp') is not None
-
 def install_ytdlp():
+    global HAS_YTDLP
     print("[*] Installing yt-dlp...")
     try:
         subprocess.run([sys.executable, '-m', 'pip', 'install', 'yt-dlp'], check=True)
+        HAS_YTDLP = True
         print("[✓] yt-dlp installed")
         return True
     except Exception as e:
         print(f"[!] Failed to install yt-dlp: {e}")
         return False
 
-# ─── SESSION FACTORIES ────────────────────────────────────────
+# ─── SESSION FACTORY ──────────────────────────────────────────
 def make_session(mobile=False):
     s = requests.Session()
     s.headers.update({'User-Agent': UA_MOBILE if mobile else UA_DESKTOP})
@@ -133,11 +122,14 @@ def make_cf_session():
 
 # ─── HELPERS ──────────────────────────────────────────────────
 def safe_get(session, url, timeout=20, referer=None, retries=3):
-    if referer:
-        session.headers.update({'Referer': referer})
+    """GET with retries. Referer merged into session headers per-request safely."""
     for attempt in range(retries):
         try:
-            r = session.get(url, timeout=timeout)
+            # Merge referer without permanently mutating session headers
+            req_headers = dict(session.headers)
+            if referer:
+                req_headers['Referer'] = referer
+            r = session.get(url, timeout=timeout, headers=req_headers)
             return r
         except Exception as e:
             print(f"  [!] Attempt {attempt+1}/{retries} failed: {e}")
@@ -158,38 +150,81 @@ def clean_name(slug):
     return name.title()
 
 def safe_filename(name):
-    return re.sub(r'[<>:"/\\|?*]', '', name).strip()
+    """Remove invalid chars, collapse spaces, strip trailing dots (Windows safe)."""
+    name = re.sub(r'[<>:"/\\|?*]', '', name)
+    name = re.sub(r'\s+', ' ', name)
+    name = name.strip().rstrip('.')
+    return name
 
 def is_streaming_link(url):
     return '.m3u8' in url or 'manifest' in url.lower()
 
+def base_domain(url):
+    m = re.search(r'(https?://[^/]+)', url)
+    return m.group(1) if m else ''
+
+# ─── DOWNLOAD SUMMARY TRACKER ─────────────────────────────────
+class DownloadSummary:
+    def __init__(self):
+        self.success = 0
+        self.skipped = 0
+        self.failed  = 0
+
+    def report(self):
+        total = self.success + self.skipped + self.failed
+        # Fix 11: skip report if nothing was attempted
+        if total == 0:
+            return
+        print(f"\n{'='*50}")
+        print(f"  DOWNLOAD COMPLETE")
+        print(f"  Total:     {total}")
+        print(f"  ✓ Done:    {self.success}")
+        if self.skipped:
+            print(f"  ✓ Skipped: {self.skipped} (already downloaded)")
+        if self.failed:
+            print(f"  ✗ Failed:  {self.failed}")
+        print(f"{'='*50}")
+
 # ─── DOWNLOADER ───────────────────────────────────────────────
-def download_with_aria2c(url, folder, filename):
-    """Download using aria2c — handles resume, retries, unstable networks."""
-    if not has_aria2c():
+def already_downloaded(folder, filename):
+    """Check if file exists and is complete (>10MB)."""
+    base = re.sub(r'\.(mp4|mkv|m3u8)$', '', filename)
+    for ext in ['mp4', 'mkv', 'webm']:
+        filepath = os.path.join(folder, f"{base}.{ext}")
+        if os.path.exists(filepath):
+            size = os.path.getsize(filepath)
+            if size > 10 * 1024 * 1024:
+                return True, filepath
+            else:
+                print(f"  [!] Incomplete file ({size/1024/1024:.1f}MB) — re-downloading")
+                os.remove(filepath)
+                return False, None
+    return False, None
+
+def download_with_aria2c(url, folder, filename, summary):
+    if not HAS_ARIA2C:
         if not install_aria2c():
             print("[!] aria2c unavailable — falling back to requests")
-            return download_with_requests(url, folder, filename)
+            return download_with_requests(url, folder, filename, summary)
 
     os.makedirs(folder, exist_ok=True)
     session_file = os.path.join(folder, '.aria2_session.txt')
-
     print(f"  [↓] aria2c: {filename}")
     try:
         cmd = [
             'aria2c',
-            '-c',                          # resume partial downloads
-            '--max-tries=0',               # infinite retries
-            '--retry-wait=10',             # wait 10s before retry
-            '--timeout=60',                # connection timeout
-            '--connect-timeout=60',        # initial connect timeout
+            '-c',
+            '--max-tries=0',
+            '--retry-wait=10',
+            '--timeout=60',
+            '--connect-timeout=60',
             '--save-session', session_file,
-            '--save-session-interval=30',  # save progress every 30s
-            '--file-allocation=none',      # faster on Android
-            '-x', '4',                     # 4 connections per server
-            '-s', '4',                     # 4 splits
+            '--save-session-interval=30',
+            '--file-allocation=none',
+            '-x', '4',
+            '-s', '4',
             '--user-agent', UA_DESKTOP,
-            '--referer', '/'.join(url.split('/')[:3]) + '/',
+            '--referer', base_domain(url) + '/',
             '-d', folder,
             '-o', filename,
             url
@@ -197,31 +232,35 @@ def download_with_aria2c(url, folder, filename):
         result = subprocess.run(cmd)
         if result.returncode == 0:
             print(f"  [✓] Done: {filename}")
-            # Clean up session file on success
             if os.path.exists(session_file):
                 os.remove(session_file)
+            summary.success += 1
             return True
         else:
             print(f"  [✗] aria2c failed (code {result.returncode})")
+            summary.failed += 1
             return False
     except Exception as e:
         print(f"  [!] aria2c error: {e}")
+        summary.failed += 1
         return False
 
-def download_with_requests(url, folder, filename):
-    """Fallback direct download using requests."""
+def download_with_requests(url, folder, filename, summary):
+    """Fallback downloader — cleans up partial files on failure."""
     filepath = os.path.join(folder, filename)
     os.makedirs(folder, exist_ok=True)
     try:
-        session = make_session()
-        session.headers.update({'Referer': '/'.join(url.split('/')[:3]) + '/'})
-        r = session.get(url, stream=True, timeout=30)
+        s = make_session()
+        r = s.get(url, stream=True, timeout=30,
+                  headers={**dict(s.headers), 'Referer': base_domain(url) + '/'})
         if r.status_code != 200:
             print(f"  [!] HTTP {r.status_code}")
+            summary.failed += 1
             return False
         content_type = r.headers.get('content-type', '')
         if 'text/html' in content_type:
             print(f"  [!] Got HTML instead of video")
+            summary.failed += 1
             return False
         total = int(r.headers.get('content-length', 0))
         downloaded = 0
@@ -236,27 +275,37 @@ def download_with_requests(url, folder, filename):
                         mb_total = total / (1024 * 1024)
                         print(f"\r  [↓] {pct}% — {mb_done:.1f}/{mb_total:.1f} MB", end='', flush=True)
         print()
-        if os.path.getsize(filepath) < 1024 * 100:
-            os.remove(filepath)
-            print(f"  [!] File too small, likely failed")
+        if not os.path.exists(filepath) or os.path.getsize(filepath) < 1024 * 100:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+            print(f"  [!] File too small — likely failed")
+            summary.failed += 1
             return False
         print(f"  [✓] Saved: {filepath}")
+        summary.success += 1
         return True
     except Exception as e:
+        if os.path.exists(filepath):
+            os.remove(filepath)
         print(f"  [!] requests error: {e}")
+        summary.failed += 1
         return False
 
-def download_with_ytdlp(url, folder, filename):
-    """Download streaming links using yt-dlp + aria2c as external downloader."""
+def download_with_ytdlp(url, folder, filename, summary):
     global SELECTED_QUALITY, QUALITY_ASKED
     if not QUALITY_ASKED:
         ask_quality()
         QUALITY_ASKED = True
 
-    if not has_ytdlp():
+    if not HAS_YTDLP:
         if not install_ytdlp():
             print(f"  [!] yt-dlp unavailable")
+            summary.failed += 1
             return False
+
+    # Fix 8: warn if ffmpeg missing — needed for merging video+audio
+    if not HAS_FFMPEG:
+        print(f"  [!] ffmpeg not found — quality merge may fail. Install: pkg install ffmpeg")
 
     os.makedirs(folder, exist_ok=True)
     base = re.sub(r'\.(mp4|mkv|m3u8)$', '', filename)
@@ -275,8 +324,7 @@ def download_with_ytdlp(url, folder, filename):
             '--fragment-retries', 'infinite',
             '--retry-sleep', '10',
         ]
-        # Use aria2c as external downloader if available
-        if has_aria2c():
+        if HAS_ARIA2C:
             cmd += [
                 '--external-downloader', 'aria2c',
                 '--external-downloader-args',
@@ -286,45 +334,26 @@ def download_with_ytdlp(url, folder, filename):
         result = subprocess.run(cmd)
         if result.returncode == 0:
             print(f"  [✓] Done: {filename}")
+            summary.success += 1
             return True
         else:
             print(f"  [✗] yt-dlp failed")
+            summary.failed += 1
             return False
     except Exception as e:
         print(f"  [!] yt-dlp error: {e}")
+        summary.failed += 1
         return False
 
-def already_downloaded(folder, filename):
-    """Check if file already exists and is complete (>10MB)."""
-    base = re.sub(r'\.(mp4|mkv|m3u8)$', '', filename)
-    # Check all possible extensions
-    for ext in ['mp4', 'mkv', 'webm']:
-        filepath = os.path.join(folder, f"{base}.{ext}")
-        if os.path.exists(filepath):
-            size = os.path.getsize(filepath)
-            if size > 10 * 1024 * 1024:  # more than 10MB = complete
-                return True, filepath
-            else:
-                print(f"  [!] Found incomplete file ({size/1024/1024:.1f}MB) — re-downloading")
-                os.remove(filepath)
-                return False, None
-    return False, None
-
-def download_file(url, folder, filename):
-    """
-    Smart downloader:
-    - Skips already completed downloads
-    - m3u8/streaming → yt-dlp + aria2c
-    - direct mp4/mkv → aria2c, requests as fallback
-    """
-    done, path = already_downloaded(folder, filename)
+def download_file(url, folder, filename, summary):
+    done, _ = already_downloaded(folder, filename)
     if done:
         print(f"  [✓] Already downloaded — skipping")
+        summary.skipped += 1
         return True
-
     if is_streaming_link(url):
-        return download_with_ytdlp(url, folder, filename)
-    return download_with_aria2c(url, folder, filename)
+        return download_with_ytdlp(url, folder, filename, summary)
+    return download_with_aria2c(url, folder, filename, summary)
 
 # ─── FILE HOST RESOLVERS ──────────────────────────────────────
 
@@ -348,22 +377,25 @@ def resolve_downloadwella(url, session):
 
 def resolve_loadedfiles(url, session):
     try:
-        session.headers.update({'Referer': 'https://9jarocks.net/'})
-        r1 = safe_get(session, url)
+        r1 = safe_get(session, url, referer='https://9jarocks.net/')
         if not r1:
             return None
         m1 = re.search(r"var downloadUrl = '(https://loadedfiles\.org/[^']+)'", r1.text)
         if not m1:
             return None
-        session.headers.update({'Referer': 'https://loadedfiles.org/'})
-        r2 = safe_get(session, m1.group(1))
+        r2 = safe_get(session, m1.group(1), referer='https://loadedfiles.org/')
         if not r2:
             return None
         m2 = re.search(r"var downloadUrl = '(https://loadedfiles\.org/[^']+)'", r2.text)
         if not m2:
             return None
-        r3 = session.get(m2.group(1), timeout=20, allow_redirects=False)
-        return r3.headers.get('location')
+        # Fix 3: proper error handling on final redirect
+        try:
+            r3 = session.get(m2.group(1), timeout=20, allow_redirects=False)
+            return r3.headers.get('location')
+        except Exception as e:
+            print(f"  [!] Loadedfiles redirect failed: {e}")
+            return None
     except Exception as e:
         print(f"  [!] Loadedfiles: {e}")
         return None
@@ -391,8 +423,7 @@ def resolve_wildshare(url):
 
 def resolve_streamtape(url, session):
     try:
-        session.headers.update({'Referer': 'https://watchadsontape.com/'})
-        r = safe_get(session, url)
+        r = safe_get(session, url, referer='https://watchadsontape.com/')
         if not r or r.status_code == 404:
             return None
         for line in r.text.split('\n'):
@@ -418,11 +449,7 @@ def resolve_streamtape(url, session):
 
 def resolve_vidmoly(embed_url, session):
     try:
-        session.headers.update({
-            'User-Agent': UA_DESKTOP,
-            'Referer': 'https://myasiantv9.com.ro/'
-        })
-        r = safe_get(session, embed_url)
+        r = safe_get(session, embed_url, referer='https://myasiantv9.com.ro/')
         if not r:
             return None
         m3u8 = re.findall(r'https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*', r.text)
@@ -437,12 +464,13 @@ def resolve_vidmoly(embed_url, session):
         return None
 
 def resolve_vidbasic(embed_url, session):
-    BLOCKED_HOSTS = ['asianload', 'dood', 'streamvid']
+    # Fix 1: moved outside loop — no need to recreate on every attempt
+    BLOCKED_HOSTS   = ['asianload', 'dood', 'streamvid']
     PREFERRED_HOSTS = ['watchadsontape.com', 'streamtape']
+
     for attempt in range(2):
         try:
-            session.headers.update({'User-Agent': UA_DESKTOP, 'Referer': 'https://myasiantv9.com.ro/'})
-            r = safe_get(session, embed_url)
+            r = safe_get(session, embed_url, referer='https://myasiantv9.com.ro/')
             if not r:
                 continue
             raw_servers = re.findall(r'data-video="(https?://[^"]+)"', r.text)
@@ -460,8 +488,7 @@ def resolve_vidbasic(embed_url, session):
                         return result
                 else:
                     try:
-                        session.headers.update({'Referer': embed_url})
-                        r2 = safe_get(session, sv_url, timeout=15)
+                        r2 = safe_get(session, sv_url, referer=embed_url, timeout=15)
                         if r2:
                             v = find_direct_video(r2.text)
                             if v:
@@ -520,16 +547,19 @@ def extract_nkiri(url, session):
         if 'downloadwella.com' in a['href']
     ))
     print(f"[*] Found {len(links)} episode(s) — saving to: {folder}")
+    summary = DownloadSummary()
     for i, ep_url in enumerate(links, 1):
         ep_name = ep_url.split('/')[-1].replace('.html', '')
         print(f"\n[{i}/{len(links)}] {ep_name}")
         direct = resolve_downloadwella(ep_url, session)
         if direct:
             ext = 'mkv' if '.mkv' in direct else 'mp4'
-            download_file(direct, folder, safe_filename(f"{ep_name}.{ext}"))
+            download_file(direct, folder, safe_filename(f"{ep_name}.{ext}"), summary)
         else:
             print(f"  [✗] Could not extract link")
+            summary.failed += 1
         time.sleep(1)
+    summary.report()
 
 def extract_dramakey_com(url, session):
     print("[*] DramaKey.com mode")
@@ -548,16 +578,19 @@ def extract_dramakey_com(url, session):
         if 'downloadwella.com' in a['href']
     ))
     print(f"[*] Found {len(links)} episode(s) — saving to: {folder}")
+    summary = DownloadSummary()
     for i, ep_url in enumerate(links, 1):
         ep_name = ep_url.split('/')[-1].replace('.html', '')
         print(f"\n[{i}/{len(links)}] {ep_name}")
         direct = resolve_downloadwella(ep_url, session)
         if direct:
             ext = 'mkv' if '.mkv' in direct else 'mp4'
-            download_file(direct, folder, safe_filename(f"{ep_name}.{ext}"))
+            download_file(direct, folder, safe_filename(f"{ep_name}.{ext}"), summary)
         else:
             print(f"  [✗] Could not extract link")
+            summary.failed += 1
         time.sleep(1)
+    summary.report()
 
 def extract_9jarocks(url, session):
     print("[*] 9jaRocks mode")
@@ -566,8 +599,7 @@ def extract_9jarocks(url, session):
     name = clean_name(name)
     print(f"[*] Title: {name}")
     folder = os.path.join(BASE_DIR, safe_filename(name))
-    session.headers.update({'Referer': 'https://9jarocks.net/'})
-    r = safe_get(session, url)
+    r = safe_get(session, url, referer='https://9jarocks.net/')
     if not r:
         return
     soup = BeautifulSoup(r.text, 'html.parser')
@@ -576,16 +608,19 @@ def extract_9jarocks(url, session):
         if 'loadedfiles.org' in a['href']
     ))
     print(f"[*] Found {len(lf_links)} file(s) — saving to: {folder}")
+    summary = DownloadSummary()
     for i, lf_url in enumerate(lf_links, 1):
         fname = lf_url.split('/')[-1][:60]
         print(f"\n[{i}/{len(lf_links)}] {fname}")
         direct = resolve_loadedfiles(lf_url, session)
         if direct:
             ext = 'mkv' if '.mkv' in direct else 'mp4'
-            download_file(direct, folder, safe_filename(f"{fname}.{ext}"))
+            download_file(direct, folder, safe_filename(f"{fname}.{ext}"), summary)
         else:
             print(f"  [✗] Could not extract link")
+            summary.failed += 1
         time.sleep(1)
+    summary.report()
 
 def extract_naijaprey(url, session):
     print("[*] NaijaPrey mode")
@@ -593,8 +628,7 @@ def extract_naijaprey(url, session):
     name = clean_name(slug)
     print(f"[*] Title: {name}")
     folder = os.path.join(BASE_DIR, safe_filename(name))
-    session.headers.update({'Referer': 'https://www.naijaprey.tv/'})
-    r = safe_get(session, url)
+    r = safe_get(session, url, referer='https://www.naijaprey.tv/')
     if not r:
         return
     soup = BeautifulSoup(r.text, 'html.parser')
@@ -603,13 +637,14 @@ def extract_naijaprey(url, session):
         if 'vdl.np-downloader.com' in a['href']
     ))
     print(f"[*] Found {len(ep_links)} episode(s) — saving to: {folder}")
+    summary = DownloadSummary()
     for i, ep_url in enumerate(ep_links, 1):
         ep_name = ep_url.rstrip('/').split('/')[-1]
         print(f"\n[{i}/{len(ep_links)}] {ep_name}")
         try:
-            session.headers.update({'Referer': 'https://www.naijaprey.tv/'})
-            r2 = safe_get(session, ep_url)
+            r2 = safe_get(session, ep_url, referer='https://www.naijaprey.tv/')
             if not r2:
+                summary.failed += 1
                 continue
             soup2 = BeautifulSoup(r2.text, 'html.parser')
             ws_url = next((a['href'] for a in soup2.find_all('a', href=True)
@@ -618,14 +653,18 @@ def extract_naijaprey(url, session):
                 direct = resolve_wildshare(ws_url)
                 if direct:
                     ext = 'mkv' if '.mkv' in direct else 'mp4'
-                    download_file(direct, folder, safe_filename(f"{ep_name}.{ext}"))
+                    download_file(direct, folder, safe_filename(f"{ep_name}.{ext}"), summary)
                 else:
                     print(f"  [✗] Wildshare failed")
+                    summary.failed += 1
             else:
                 print(f"  [!] No wildshare link found")
+                summary.failed += 1
         except Exception as e:
             print(f"  [!] Error: {e}")
+            summary.failed += 1
         time.sleep(2)
+    summary.report()
 
 def extract_myasiantv(url, session):
     print("[*] MyAsianTV mode")
@@ -635,34 +674,37 @@ def extract_myasiantv(url, session):
     name = clean_name(name)
     print(f"[*] Series: {name}")
     folder = os.path.join(BASE_DIR, safe_filename(name))
-    domain_match = re.search(r'(https?://[^/]+)', url)
-    base_domain = domain_match.group(1) if domain_match else ''
+    bd = base_domain(url)
+    summary = DownloadSummary()
+
     if 'episode-' in url:
         ep_links = [url]
+        # Fix 2: print saving location for single episode too
+        print(f"[*] Saving to: {folder}")
     else:
         print("[*] Fetching episode list...")
-        session.headers.update({'Referer': base_domain + '/'})
-        r = safe_get(session, url, timeout=30)
+        r = safe_get(session, url, referer=bd + '/', timeout=30)
         if not r:
             return
         soup = BeautifulSoup(r.text, 'html.parser')
         show_slug = re.sub(r'-\d{4}.*$', '', slug)
         ep_links = list(dict.fromkeys(
             a['href'] for a in soup.find_all('a', href=True)
-            if ('episode-' in a['href'] and base_domain in a['href'] and show_slug in a['href'])
+            if ('episode-' in a['href'] and bd in a['href'] and show_slug in a['href'])
         ))
         if not ep_links:
             print("[!] No episode links found")
             return
         ep_links.sort(key=lambda u: int(m.group(1)) if (m := re.search(r'episode-(\d+)', u)) else 0)
         print(f"[*] Found {len(ep_links)} episode(s) — saving to: {folder}")
+
     for i, ep_url in enumerate(ep_links, 1):
         ep_name = ep_url.rstrip('/').split('/')[-1]
         print(f"\n[{i}/{len(ep_links)}] {ep_name}")
-        session.headers.update({'Referer': base_domain + '/'})
-        r = safe_get(session, ep_url, timeout=30)
+        r = safe_get(session, ep_url, referer=bd + '/', timeout=30)
         if not r:
             print(f"  [✗] Could not fetch episode page")
+            summary.failed += 1
             continue
         soup = BeautifulSoup(r.text, 'html.parser')
         iframe = soup.find('iframe', src=re.compile(r'vidbasic|vidmoly'))
@@ -670,16 +712,19 @@ def extract_myasiantv(url, session):
             iframe = soup.find('iframe', src=True)
         if not iframe:
             print(f"  [!] No iframe found")
+            summary.failed += 1
             continue
         src = iframe.get('src', '')
         if not src.startswith('http'):
             src = 'https:' + src
         direct = resolve_embed(src, session)
         if direct:
-            download_file(direct, folder, safe_filename(f"{ep_name}.mp4"))
+            download_file(direct, folder, safe_filename(f"{ep_name}.mp4"), summary)
         else:
             print(f"  [✗] Could not extract video")
+            summary.failed += 1
         time.sleep(1)
+    summary.report()
 
 def extract_dramarain(url, session):
     site = 'DramaKey.cc' if 'dramakey.cc' in url else 'DramaRain'
@@ -689,11 +734,13 @@ def extract_dramarain(url, session):
     name = clean_name(name)
     print(f"[*] Title: {name}")
     folder = os.path.join(BASE_DIR, safe_filename(name))
-    session.headers.update({'Referer': url})
-    r = safe_get(session, url)
+    # Fix 5: use base_domain not the full page URL as referer
+    r = safe_get(session, url, referer=base_domain(url))
     if not r:
         return
     soup = BeautifulSoup(r.text, 'html.parser')
+    summary = DownloadSummary()
+
     drip_links = [(a.text.strip(), a['href']) for a in soup.find_all('a', href=True)
                   if 'drip.waffi.cloud' in a['href']]
     if drip_links:
@@ -701,8 +748,10 @@ def extract_dramarain(url, session):
         for i, (label, link) in enumerate(drip_links, 1):
             fname = safe_filename(label or f"episode-{i}")
             print(f"\n[{i}/{len(drip_links)}] {fname}")
-            download_file(link, folder, f"{fname}.mp4")
+            download_file(link, folder, f"{fname}.mp4", summary)
+        summary.report()
         return
+
     dl_links = [(a.text.strip(), a['href']) for a in soup.find_all('a', href=True)
                 if any(x in a['href'] for x in ['dramarain.com/download', 'drip.waffi.cloud'])]
     if dl_links:
@@ -712,11 +761,14 @@ def extract_dramarain(url, session):
             print(f"\n[{i}/{len(dl_links)}] {fname}")
             direct = dl_url if 'drip.waffi.cloud' in dl_url else resolve_drip_waffi(dl_url, session)
             if direct:
-                download_file(direct, folder, f"{fname}.mp4")
+                download_file(direct, folder, f"{fname}.mp4", summary)
             else:
                 print(f"  [✗] Could not resolve link")
+                summary.failed += 1
             time.sleep(0.5)
+        summary.report()
         return
+
     all_links = [a['href'] for a in soup.find_all('a', href=True)]
     print(f"[!] No download links found. Page has {len(all_links)} total links.")
     print(f"[!] Sample: {all_links[:5]}")
@@ -742,12 +794,9 @@ def detect_site(url):
 
 # ─── MAIN ─────────────────────────────────────────────────────
 def main():
-    # Android setup first — wake lock + tmux (this may re-exec the process)
     setup_android()
-
     session = make_session()
 
-    # Non-interactive mode
     if len(sys.argv) >= 2:
         url = sys.argv[1].strip()
         extractor = detect_site(url)
@@ -757,7 +806,6 @@ def main():
         extractor(url, session)
         return
 
-    # Interactive loop
     print("=" * 50)
     print("  DOWNLOAD TOOLKIT")
     print(f"  Saving to: {BASE_DIR}")
@@ -779,6 +827,10 @@ def main():
         if url.lower() == 'exit':
             print("Bye!")
             break
+        # Fix 10: friendly message for non-URL input
+        if not url.startswith('http'):
+            print("[!] That doesn't look like a URL. Paste a full link starting with http")
+            continue
         extractor = detect_site(url)
         if not extractor:
             print(f"[!] Unsupported site. Supported: {', '.join(SITE_MAP.keys())}")
