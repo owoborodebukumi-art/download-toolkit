@@ -19,14 +19,45 @@ UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 UA_MOBILE  = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36'
 
 # ─── OS DETECTION ─────────────────────────────────────────────
+IS_ANDROID = os.path.exists('/storage/emulated/0')
+
 def get_base_dir():
-    if os.path.exists('/storage/emulated/0'):
+    if IS_ANDROID:
         return '/storage/emulated/0/Anon'
     if platform.system() == 'Windows':
         return os.path.join(os.path.expanduser('~'), 'Downloads', 'Anon')
     return os.path.join(os.path.expanduser('~'), 'Downloads', 'Anon')
 
 BASE_DIR = get_base_dir()
+
+# ─── ANDROID SETUP ────────────────────────────────────────────
+def setup_android():
+    """Enable wake lock and ensure we're inside tmux on Android."""
+    if not IS_ANDROID:
+        return
+
+    # Enable wake lock to prevent CPU/network sleep
+    if shutil.which('termux-wake-lock'):
+        try:
+            subprocess.Popen(['termux-wake-lock'],
+                           stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+            print("[✓] Wake lock enabled — screen can go off safely")
+        except Exception:
+            pass
+    else:
+        print("[!] termux-wake-lock not found — install with: pkg install termux-api")
+
+    # Auto-start inside tmux if not already inside
+    if not os.environ.get('TMUX'):
+        if shutil.which('tmux'):
+            print("[*] Starting persistent tmux session...")
+            # Re-launch this script inside tmux
+            os.execvp('tmux', ['tmux', 'new-session', '-A', '-s', 'download',
+                               sys.executable] + sys.argv)
+        else:
+            print("[!] tmux not found — install with: pkg install tmux")
+            print("[!] Without tmux, closing Termux will stop downloads")
 
 # ─── QUALITY SELECTION ────────────────────────────────────────
 QUALITY_MAP = {
@@ -35,7 +66,7 @@ QUALITY_MAP = {
     '3': ('720p',  'bestvideo[height<=720]+bestaudio/best[height<=720]'),
     '4': ('1080p', 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'),
 }
-SELECTED_QUALITY = ("480p", "bestvideo[height<=480]+bestaudio/best[height<=480]")  # default
+SELECTED_QUALITY = ('480p', 'bestvideo[height<=480]+bestaudio/best[height<=480]')
 QUALITY_ASKED = False
 
 def ask_quality():
@@ -54,6 +85,26 @@ def ask_quality():
             print(f"[✓] Quality set to {SELECTED_QUALITY[0]}")
             break
         print("[!] Enter 1, 2, 3 or 4")
+
+# ─── ARIA2C CHECK ─────────────────────────────────────────────
+def has_aria2c():
+    return shutil.which('aria2c') is not None
+
+def install_aria2c():
+    print("[*] Installing aria2...")
+    try:
+        if IS_ANDROID:
+            subprocess.run(['pkg', 'install', 'aria2', '-y'], check=True)
+        elif platform.system() == 'Windows':
+            print("[!] Install aria2 manually from https://github.com/aria2/aria2/releases")
+            return False
+        else:
+            subprocess.run(['sudo', 'apt', 'install', 'aria2', '-y'], check=True)
+        print("[✓] aria2 installed")
+        return True
+    except Exception as e:
+        print(f"[!] Failed to install aria2: {e}")
+        return False
 
 # ─── YTDLP CHECK ──────────────────────────────────────────────
 def has_ytdlp():
@@ -113,31 +164,67 @@ def is_streaming_link(url):
     return '.m3u8' in url or 'manifest' in url.lower()
 
 # ─── DOWNLOADER ───────────────────────────────────────────────
-def download_direct(url, folder, filename):
-    """Download direct mp4/mkv using requests with progress bar."""
+def download_with_aria2c(url, folder, filename):
+    """Download using aria2c — handles resume, retries, unstable networks."""
+    if not has_aria2c():
+        if not install_aria2c():
+            print("[!] aria2c unavailable — falling back to requests")
+            return download_with_requests(url, folder, filename)
+
+    os.makedirs(folder, exist_ok=True)
+    session_file = os.path.join(folder, '.aria2_session.txt')
+
+    print(f"  [↓] aria2c: {filename}")
+    try:
+        cmd = [
+            'aria2c',
+            '-c',                          # resume partial downloads
+            '--max-tries=0',               # infinite retries
+            '--retry-wait=10',             # wait 10s before retry
+            '--timeout=60',                # connection timeout
+            '--connect-timeout=60',        # initial connect timeout
+            '--save-session', session_file,
+            '--save-session-interval=30',  # save progress every 30s
+            '--file-allocation=none',      # faster on Android
+            '-x', '4',                     # 4 connections per server
+            '-s', '4',                     # 4 splits
+            '--user-agent', UA_DESKTOP,
+            '--referer', '/'.join(url.split('/')[:3]) + '/',
+            '-d', folder,
+            '-o', filename,
+            url
+        ]
+        result = subprocess.run(cmd)
+        if result.returncode == 0:
+            print(f"  [✓] Done: {filename}")
+            # Clean up session file on success
+            if os.path.exists(session_file):
+                os.remove(session_file)
+            return True
+        else:
+            print(f"  [✗] aria2c failed (code {result.returncode})")
+            return False
+    except Exception as e:
+        print(f"  [!] aria2c error: {e}")
+        return False
+
+def download_with_requests(url, folder, filename):
+    """Fallback direct download using requests."""
     filepath = os.path.join(folder, filename)
     os.makedirs(folder, exist_ok=True)
-
     try:
         session = make_session()
-        session.headers.update({
-            'Referer': '/'.join(url.split('/')[:3]) + '/',
-            'Accept': '*/*',
-        })
+        session.headers.update({'Referer': '/'.join(url.split('/')[:3]) + '/'})
         r = session.get(url, stream=True, timeout=30)
-
         if r.status_code != 200:
             print(f"  [!] HTTP {r.status_code}")
             return False
-
         content_type = r.headers.get('content-type', '')
         if 'text/html' in content_type:
-            print(f"  [!] Got HTML page instead of video file")
+            print(f"  [!] Got HTML instead of video")
             return False
-
         total = int(r.headers.get('content-length', 0))
         downloaded = 0
-
         with open(filepath, 'wb') as f:
             for chunk in r.iter_content(chunk_size=1024 * 512):
                 if chunk:
@@ -149,24 +236,23 @@ def download_direct(url, folder, filename):
                         mb_total = total / (1024 * 1024)
                         print(f"\r  [↓] {pct}% — {mb_done:.1f}/{mb_total:.1f} MB", end='', flush=True)
         print()
-        size = os.path.getsize(filepath)
-        if size < 1024 * 100:  # less than 100KB = probably failed
+        if os.path.getsize(filepath) < 1024 * 100:
             os.remove(filepath)
-            print(f"  [!] Downloaded file too small, likely failed")
+            print(f"  [!] File too small, likely failed")
             return False
         print(f"  [✓] Saved: {filepath}")
         return True
-
     except Exception as e:
-        print(f"  [!] Direct download error: {e}")
+        print(f"  [!] requests error: {e}")
         return False
 
 def download_with_ytdlp(url, folder, filename):
+    """Download streaming links using yt-dlp + aria2c as external downloader."""
     global SELECTED_QUALITY, QUALITY_ASKED
     if not QUALITY_ASKED:
         ask_quality()
         QUALITY_ASKED = True
-    """Download using yt-dlp with selected quality."""
+
     if not has_ytdlp():
         if not install_ytdlp():
             print(f"  [!] yt-dlp unavailable")
@@ -179,14 +265,25 @@ def download_with_ytdlp(url, folder, filename):
 
     print(f"  [↓] yt-dlp ({quality_label}): {filename}")
     try:
-        result = subprocess.run([
+        cmd = [
             'yt-dlp',
             '-f', format_str,
             '--merge-output-format', 'mp4',
             '-o', out_template,
             '--no-playlist',
-            url
-        ])
+            '--retries', 'infinite',
+            '--fragment-retries', 'infinite',
+            '--retry-sleep', '10',
+        ]
+        # Use aria2c as external downloader if available
+        if has_aria2c():
+            cmd += [
+                '--external-downloader', 'aria2c',
+                '--external-downloader-args',
+                'aria2c:-x 4 -s 4 -c --max-tries=0 --retry-wait=10 --timeout=60 --connect-timeout=60 --file-allocation=none'
+            ]
+        cmd.append(url)
+        result = subprocess.run(cmd)
         if result.returncode == 0:
             print(f"  [✓] Done: {filename}")
             return True
@@ -197,21 +294,37 @@ def download_with_ytdlp(url, folder, filename):
         print(f"  [!] yt-dlp error: {e}")
         return False
 
+def already_downloaded(folder, filename):
+    """Check if file already exists and is complete (>10MB)."""
+    base = re.sub(r'\.(mp4|mkv|m3u8)$', '', filename)
+    # Check all possible extensions
+    for ext in ['mp4', 'mkv', 'webm']:
+        filepath = os.path.join(folder, f"{base}.{ext}")
+        if os.path.exists(filepath):
+            size = os.path.getsize(filepath)
+            if size > 10 * 1024 * 1024:  # more than 10MB = complete
+                return True, filepath
+            else:
+                print(f"  [!] Found incomplete file ({size/1024/1024:.1f}MB) — re-downloading")
+                os.remove(filepath)
+                return False, None
+    return False, None
+
 def download_file(url, folder, filename):
     """
     Smart downloader:
-    - m3u8/streaming → yt-dlp
-    - direct mp4/mkv → requests first, yt-dlp as fallback
+    - Skips already completed downloads
+    - m3u8/streaming → yt-dlp + aria2c
+    - direct mp4/mkv → aria2c, requests as fallback
     """
+    done, path = already_downloaded(folder, filename)
+    if done:
+        print(f"  [✓] Already downloaded — skipping")
+        return True
+
     if is_streaming_link(url):
         return download_with_ytdlp(url, folder, filename)
-
-    print(f"  [↓] Downloading: {filename}")
-    success = download_direct(url, folder, filename)
-    if not success:
-        print(f"  [!] Falling back to yt-dlp...")
-        success = download_with_ytdlp(url, folder, filename)
-    return success
+    return download_with_aria2c(url, folder, filename)
 
 # ─── FILE HOST RESOLVERS ──────────────────────────────────────
 
@@ -629,6 +742,9 @@ def detect_site(url):
 
 # ─── MAIN ─────────────────────────────────────────────────────
 def main():
+    # Android setup first — wake lock + tmux (this may re-exec the process)
+    setup_android()
+
     session = make_session()
 
     # Non-interactive mode
@@ -649,8 +765,6 @@ def main():
     print("Supported sites:")
     for domain in SITE_MAP:
         print(f"  • {domain}")
-
-
     print("\nPaste a link and press Enter | 'exit' to quit")
 
     while True:
@@ -660,18 +774,15 @@ def main():
         except (EOFError, KeyboardInterrupt):
             print("\nBye!")
             break
-
         if not url:
             continue
         if url.lower() == 'exit':
             print("Bye!")
             break
-
         extractor = detect_site(url)
         if not extractor:
             print(f"[!] Unsupported site. Supported: {', '.join(SITE_MAP.keys())}")
             continue
-
         extractor(url, session)
 
 if __name__ == '__main__':
