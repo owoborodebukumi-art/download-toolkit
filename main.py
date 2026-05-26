@@ -31,22 +31,30 @@ HAS_FFMPEG = shutil.which('ffmpeg') is not None
 def setup_android():
     if not IS_ANDROID:
         return
+
+    # Wake lock
     if shutil.which('termux-wake-lock'):
         try:
             subprocess.Popen(['termux-wake-lock'],
                              stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
             print("[✓] Wake lock enabled — screen can go off safely")
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[!] Wake lock failed: {e}")
     else:
         print("[!] termux-wake-lock not found — install with: pkg install termux-api")
 
+    # Auto-launch inside tmux
     if not os.environ.get('TMUX'):
         if shutil.which('tmux'):
             print("[*] Starting persistent tmux session...")
-            os.execvp('tmux', ['tmux', 'new-session', '-A', '-s', 'download',
-                               sys.executable] + sys.argv)
+            try:
+                os.execvp('tmux', ['tmux', 'new-session', '-A', '-s', 'download',
+                                   sys.executable] + sys.argv)
+            except Exception as e:
+                # Fix 10: execvp failed — don't die silently, continue without tmux
+                print(f"[!] Could not start tmux: {e}")
+                print("[!] Continuing without tmux — closing Termux will stop downloads")
         else:
             print("[!] tmux not found — install with: pkg install tmux")
             print("[!] Without tmux, closing Termux will stop downloads")
@@ -84,7 +92,13 @@ def install_aria2c():
     print("[*] Installing aria2...")
     try:
         if IS_ANDROID:
-            subprocess.run(['pkg', 'install', 'aria2', '-y'], check=True)
+            # Fix 9: non-interactive to avoid dpkg conflict mid-session
+            env = os.environ.copy()
+            env['DEBIAN_FRONTEND'] = 'noninteractive'
+            subprocess.run(
+                ['pkg', 'install', 'aria2', '-y'],
+                check=True, env=env
+            )
         elif platform.system() == 'Windows':
             print("[!] Install aria2 manually from https://github.com/aria2/aria2/releases")
             return False
@@ -101,7 +115,12 @@ def install_ytdlp():
     global HAS_YTDLP
     print("[*] Installing yt-dlp...")
     try:
-        subprocess.run([sys.executable, '-m', 'pip', 'install', 'yt-dlp'], check=True)
+        # Fix 8: add --break-system-packages for Termux compatibility
+        subprocess.run(
+            [sys.executable, '-m', 'pip', 'install', 'yt-dlp',
+             '--break-system-packages', '-q'],
+            check=True
+        )
         HAS_YTDLP = True
         print("[✓] yt-dlp installed")
         return True
@@ -118,14 +137,14 @@ def make_session(mobile=False):
 def make_cf_session():
     if HAS_CURL_CFFI:
         return cf_requests.Session(impersonate='chrome120')
-    return make_session()
+    # Fix 14: be explicit that wildshare will fail without curl_cffi
+    return None
 
 # ─── HELPERS ──────────────────────────────────────────────────
 def safe_get(session, url, timeout=20, referer=None, retries=3):
-    """GET with retries. Referer merged into session headers per-request safely."""
+    """GET with retries. Referer sent per-request without mutating session."""
     for attempt in range(retries):
         try:
-            # Merge referer without permanently mutating session headers
             req_headers = dict(session.headers)
             if referer:
                 req_headers['Referer'] = referer
@@ -172,7 +191,6 @@ class DownloadSummary:
 
     def report(self):
         total = self.success + self.skipped + self.failed
-        # Fix 11: skip report if nothing was attempted
         if total == 0:
             return
         print(f"\n{'='*50}")
@@ -197,7 +215,11 @@ def already_downloaded(folder, filename):
                 return True, filepath
             else:
                 print(f"  [!] Incomplete file ({size/1024/1024:.1f}MB) — re-downloading")
-                os.remove(filepath)
+                # Fix 11: safe removal with error handling
+                try:
+                    os.remove(filepath)
+                except Exception as e:
+                    print(f"  [!] Could not remove incomplete file: {e}")
                 return False, None
     return False, None
 
@@ -208,7 +230,10 @@ def download_with_aria2c(url, folder, filename, summary):
             return download_with_requests(url, folder, filename, summary)
 
     os.makedirs(folder, exist_ok=True)
-    session_file = os.path.join(folder, '.aria2_session.txt')
+    # Fix 12: use a unique session file per download to avoid conflicts
+    safe_fname = re.sub(r'[^\w]', '_', filename)[:30]
+    session_file = os.path.join(folder, f'.aria2_{safe_fname}.txt')
+
     print(f"  [↓] aria2c: {filename}")
     try:
         cmd = [
@@ -232,8 +257,11 @@ def download_with_aria2c(url, folder, filename, summary):
         result = subprocess.run(cmd)
         if result.returncode == 0:
             print(f"  [✓] Done: {filename}")
-            if os.path.exists(session_file):
-                os.remove(session_file)
+            try:
+                if os.path.exists(session_file):
+                    os.remove(session_file)
+            except Exception:
+                pass
             summary.success += 1
             return True
         else:
@@ -276,8 +304,11 @@ def download_with_requests(url, folder, filename, summary):
                         print(f"\r  [↓] {pct}% — {mb_done:.1f}/{mb_total:.1f} MB", end='', flush=True)
         print()
         if not os.path.exists(filepath) or os.path.getsize(filepath) < 1024 * 100:
-            if os.path.exists(filepath):
-                os.remove(filepath)
+            try:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+            except Exception:
+                pass
             print(f"  [!] File too small — likely failed")
             summary.failed += 1
             return False
@@ -285,8 +316,11 @@ def download_with_requests(url, folder, filename, summary):
         summary.success += 1
         return True
     except Exception as e:
-        if os.path.exists(filepath):
-            os.remove(filepath)
+        try:
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        except Exception:
+            pass
         print(f"  [!] requests error: {e}")
         summary.failed += 1
         return False
@@ -303,9 +337,12 @@ def download_with_ytdlp(url, folder, filename, summary):
             summary.failed += 1
             return False
 
-    # Fix 8: warn if ffmpeg missing — needed for merging video+audio
+    # Fix 13: block if ffmpeg missing — yt-dlp merge will fail without it
     if not HAS_FFMPEG:
-        print(f"  [!] ffmpeg not found — quality merge may fail. Install: pkg install ffmpeg")
+        print(f"  [!] ffmpeg not found — cannot merge video and audio streams")
+        print(f"  [!] Install with: pkg install ffmpeg")
+        summary.failed += 1
+        return False
 
     os.makedirs(folder, exist_ok=True)
     base = re.sub(r'\.(mp4|mkv|m3u8)$', '', filename)
@@ -389,7 +426,6 @@ def resolve_loadedfiles(url, session):
         m2 = re.search(r"var downloadUrl = '(https://loadedfiles\.org/[^']+)'", r2.text)
         if not m2:
             return None
-        # Fix 3: proper error handling on final redirect
         try:
             r3 = session.get(m2.group(1), timeout=20, allow_redirects=False)
             return r3.headers.get('location')
@@ -401,11 +437,16 @@ def resolve_loadedfiles(url, session):
         return None
 
 def resolve_wildshare(url):
+    # Fix 14: clear error if curl_cffi missing, no silent fallback
     if not HAS_CURL_CFFI:
-        print("  [!] Wildshare requires curl_cffi — install it: pip install curl_cffi")
+        print("  [!] Wildshare requires curl_cffi")
+        print("  [!] Install with: pip install curl_cffi --break-system-packages")
         return None
     try:
         s = make_cf_session()
+        if not s:
+            print("  [!] Could not create curl_cffi session")
+            return None
         r = s.get(url, timeout=20)
         if not r or r.status_code != 200:
             return None
@@ -464,7 +505,6 @@ def resolve_vidmoly(embed_url, session):
         return None
 
 def resolve_vidbasic(embed_url, session):
-    # Fix 1: moved outside loop — no need to recreate on every attempt
     BLOCKED_HOSTS   = ['asianload', 'dood', 'streamvid']
     PREFERRED_HOSTS = ['watchadsontape.com', 'streamtape']
 
@@ -679,7 +719,6 @@ def extract_myasiantv(url, session):
 
     if 'episode-' in url:
         ep_links = [url]
-        # Fix 2: print saving location for single episode too
         print(f"[*] Saving to: {folder}")
     else:
         print("[*] Fetching episode list...")
@@ -734,7 +773,6 @@ def extract_dramarain(url, session):
     name = clean_name(name)
     print(f"[*] Title: {name}")
     folder = os.path.join(BASE_DIR, safe_filename(name))
-    # Fix 5: use base_domain not the full page URL as referer
     r = safe_get(session, url, referer=base_domain(url))
     if not r:
         return
@@ -803,7 +841,12 @@ def main():
         if not extractor:
             print(f"[!] Unsupported site: {url}")
             sys.exit(1)
-        extractor(url, session)
+        # Fix 7: wrap extractor call in try/except
+        try:
+            extractor(url, session)
+        except Exception as e:
+            print(f"\n[!] Unexpected error: {e}")
+            print("[!] Please check the URL and try again")
         return
 
     print("=" * 50)
@@ -827,7 +870,6 @@ def main():
         if url.lower() == 'exit':
             print("Bye!")
             break
-        # Fix 10: friendly message for non-URL input
         if not url.startswith('http'):
             print("[!] That doesn't look like a URL. Paste a full link starting with http")
             continue
@@ -835,7 +877,12 @@ def main():
         if not extractor:
             print(f"[!] Unsupported site. Supported: {', '.join(SITE_MAP.keys())}")
             continue
-        extractor(url, session)
+        # Fix 7: wrap extractor call in try/except
+        try:
+            extractor(url, session)
+        except Exception as e:
+            print(f"\n[!] Unexpected error: {e}")
+            print("[!] Please check the URL and try again")
 
 if __name__ == '__main__':
     main()
