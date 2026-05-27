@@ -15,8 +15,10 @@ except ImportError:
     HAS_CURL_CFFI = False
 
 # ─── CONFIG ───────────────────────────────────────────────────
-UA_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-UA_MOBILE  = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36'
+UA_DESKTOP  = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+UA_MOBILE   = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36'
+PLUTO_BASE  = 'https://plutomovies.com'
+EP_REGEX    = re.compile(r'([Ss]\d{1,2}[Ee]\d{1,2}|\b[Ee]\d{1,2}\b|\bEpisode\s*\d{1,2}\b)', re.IGNORECASE)
 
 # ─── OS DETECTION ─────────────────────────────────────────────
 IS_ANDROID = os.path.exists('/storage/emulated/0')
@@ -31,8 +33,6 @@ HAS_FFMPEG = shutil.which('ffmpeg') is not None
 def setup_android():
     if not IS_ANDROID:
         return
-
-    # Wake lock
     if shutil.which('termux-wake-lock'):
         try:
             subprocess.Popen(['termux-wake-lock'],
@@ -44,7 +44,6 @@ def setup_android():
     else:
         print("[!] termux-wake-lock not found — install with: pkg install termux-api")
 
-    # Auto-launch inside tmux
     if not os.environ.get('TMUX'):
         if shutil.which('tmux'):
             print("[*] Starting persistent tmux session...")
@@ -52,7 +51,6 @@ def setup_android():
                 os.execvp('tmux', ['tmux', 'new-session', '-A', '-s', 'download',
                                    sys.executable] + sys.argv)
             except Exception as e:
-                # Fix 10: execvp failed — don't die silently, continue without tmux
                 print(f"[!] Could not start tmux: {e}")
                 print("[!] Continuing without tmux — closing Termux will stop downloads")
         else:
@@ -92,13 +90,9 @@ def install_aria2c():
     print("[*] Installing aria2...")
     try:
         if IS_ANDROID:
-            # Fix 9: non-interactive to avoid dpkg conflict mid-session
             env = os.environ.copy()
             env['DEBIAN_FRONTEND'] = 'noninteractive'
-            subprocess.run(
-                ['pkg', 'install', 'aria2', '-y'],
-                check=True, env=env
-            )
+            subprocess.run(['pkg', 'install', 'aria2', '-y'], check=True, env=env)
         elif platform.system() == 'Windows':
             print("[!] Install aria2 manually from https://github.com/aria2/aria2/releases")
             return False
@@ -115,7 +109,6 @@ def install_ytdlp():
     global HAS_YTDLP
     print("[*] Installing yt-dlp...")
     try:
-        # Fix 8: add --break-system-packages for Termux compatibility
         subprocess.run(
             [sys.executable, '-m', 'pip', 'install', 'yt-dlp',
              '--break-system-packages', '-q'],
@@ -137,7 +130,6 @@ def make_session(mobile=False):
 def make_cf_session():
     if HAS_CURL_CFFI:
         return cf_requests.Session(impersonate='chrome120')
-    # Fix 14: be explicit that wildshare will fail without curl_cffi
     return None
 
 # ─── HELPERS ──────────────────────────────────────────────────
@@ -169,11 +161,21 @@ def clean_name(slug):
     return name.title()
 
 def safe_filename(name):
-    """Remove invalid chars, collapse spaces, strip trailing dots (Windows safe)."""
+    """Remove invalid chars, collapse spaces, strip trailing dots."""
     name = re.sub(r'[<>:"/\\|?*]', '', name)
     name = re.sub(r'\s+', ' ', name)
     name = name.strip().rstrip('.')
     return name
+
+def clean_ep_name(raw):
+    """Clean episode name from raw HTML text for use as filename."""
+    # Remove common noise patterns like (720p), [MKV], – Download, etc.
+    name = re.sub(r'\([\w\s]+p\)', '', raw)           # (720p), (1080p)
+    name = re.sub(r'\[[\w\s]+\]', '', name)            # [MKV], [MP4]
+    name = re.sub(r'download', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'[-–|]+', ' ', name)                # dashes and pipes
+    name = re.sub(r'\s+', ' ', name).strip()
+    return name or raw  # fallback to raw if cleaning leaves nothing
 
 def is_streaming_link(url):
     return '.m3u8' in url or 'manifest' in url.lower()
@@ -181,6 +183,17 @@ def is_streaming_link(url):
 def base_domain(url):
     m = re.search(r'(https?://[^/]+)', url)
     return m.group(1) if m else ''
+
+def resolve_relative_url(base_url, location):
+    """Safely resolve a redirect location that may be relative."""
+    if not location:
+        return None
+    if location.startswith('http'):
+        return location
+    bd = base_domain(base_url)
+    if bd:
+        return bd + location
+    return None
 
 # ─── DOWNLOAD SUMMARY TRACKER ─────────────────────────────────
 class DownloadSummary:
@@ -215,7 +228,6 @@ def already_downloaded(folder, filename):
                 return True, filepath
             else:
                 print(f"  [!] Incomplete file ({size/1024/1024:.1f}MB) — re-downloading")
-                # Fix 11: safe removal with error handling
                 try:
                     os.remove(filepath)
                 except Exception as e:
@@ -230,7 +242,6 @@ def download_with_aria2c(url, folder, filename, summary):
             return download_with_requests(url, folder, filename, summary)
 
     os.makedirs(folder, exist_ok=True)
-    # Fix 12: use a unique session file per download to avoid conflicts
     safe_fname = re.sub(r'[^\w]', '_', filename)[:30]
     session_file = os.path.join(folder, f'.aria2_{safe_fname}.txt')
 
@@ -337,7 +348,6 @@ def download_with_ytdlp(url, folder, filename, summary):
             summary.failed += 1
             return False
 
-    # Fix 13: block if ffmpeg missing — yt-dlp merge will fail without it
     if not HAS_FFMPEG:
         print(f"  [!] ffmpeg not found — cannot merge video and audio streams")
         print(f"  [!] Install with: pkg install ffmpeg")
@@ -437,7 +447,6 @@ def resolve_loadedfiles(url, session):
         return None
 
 def resolve_wildshare(url):
-    # Fix 14: clear error if curl_cffi missing, no silent fallback
     if not HAS_CURL_CFFI:
         print("  [!] Wildshare requires curl_cffi")
         print("  [!] Install with: pip install curl_cffi --break-system-packages")
@@ -569,68 +578,56 @@ def resolve_drip_waffi(url, session):
         print(f"  [!] Drip: {e}")
         return None
 
+# ─── SHARED DOWNLOADWELLA EXTRACTOR (Fix 6) ───────────────────
+def _extract_downloadwella_site(url, session, site_label, name_cleaner):
+    """
+    Shared extractor for sites using downloadwella.com links.
+    Used by nkiri, thenkiri, and dramakey.com — avoids duplicate code.
+    """
+    print(f"[*] {site_label} mode")
+    slug = url.rstrip('/').split('/')[-1]
+    name = name_cleaner(slug)
+    name = clean_name(name)
+    print(f"[*] Series: {name}")
+    folder = os.path.join(BASE_DIR, safe_filename(name))
+    r = safe_get(session, url)
+    if not r:
+        return
+    soup = BeautifulSoup(r.text, 'html.parser')
+    links = list(dict.fromkeys(
+        a['href'] for a in soup.find_all('a', href=True)
+        if 'downloadwella.com' in a['href']
+    ))
+    print(f"[*] Found {len(links)} episode(s) — saving to: {folder}")
+    summary = DownloadSummary()
+    for i, ep_url in enumerate(links, 1):
+        ep_name = ep_url.split('/')[-1].replace('.html', '')
+        print(f"\n[{i}/{len(links)}] {ep_name}")
+        direct = resolve_downloadwella(ep_url, session)
+        if direct:
+            ext = 'mkv' if '.mkv' in direct else 'mp4'
+            download_file(direct, folder, safe_filename(f"{ep_name}.{ext}"), summary)
+        else:
+            print(f"  [✗] Could not extract link")
+            summary.failed += 1
+        time.sleep(1)
+    summary.report()
+
 # ─── SITE EXTRACTORS ──────────────────────────────────────────
 
 def extract_nkiri(url, session):
-    print("[*] NKIRI/Thenkiri mode")
-    slug = url.rstrip('/').split('/')[-1]
-    name = re.sub(r'-s\d+.*$', '', slug, flags=re.IGNORECASE)
-    name = clean_name(name)
-    print(f"[*] Series: {name}")
-    folder = os.path.join(BASE_DIR, safe_filename(name))
-    r = safe_get(session, url)
-    if not r:
-        return
-    soup = BeautifulSoup(r.text, 'html.parser')
-    links = list(dict.fromkeys(
-        a['href'] for a in soup.find_all('a', href=True)
-        if 'downloadwella.com' in a['href']
-    ))
-    print(f"[*] Found {len(links)} episode(s) — saving to: {folder}")
-    summary = DownloadSummary()
-    for i, ep_url in enumerate(links, 1):
-        ep_name = ep_url.split('/')[-1].replace('.html', '')
-        print(f"\n[{i}/{len(links)}] {ep_name}")
-        direct = resolve_downloadwella(ep_url, session)
-        if direct:
-            ext = 'mkv' if '.mkv' in direct else 'mp4'
-            download_file(direct, folder, safe_filename(f"{ep_name}.{ext}"), summary)
-        else:
-            print(f"  [✗] Could not extract link")
-            summary.failed += 1
-        time.sleep(1)
-    summary.report()
+    _extract_downloadwella_site(
+        url, session,
+        site_label='NKIRI/Thenkiri',
+        name_cleaner=lambda s: re.sub(r'-s\d+.*$', '', s, flags=re.IGNORECASE)
+    )
 
 def extract_dramakey_com(url, session):
-    print("[*] DramaKey.com mode")
-    slug = url.rstrip('/').split('/')[-1]
-    name = re.sub(r'-s\d+.*$', '', slug, flags=re.IGNORECASE)
-    name = re.sub(r'-(season|episode|complete).*$', '', name, flags=re.IGNORECASE)
-    name = clean_name(name)
-    print(f"[*] Series: {name}")
-    folder = os.path.join(BASE_DIR, safe_filename(name))
-    r = safe_get(session, url)
-    if not r:
-        return
-    soup = BeautifulSoup(r.text, 'html.parser')
-    links = list(dict.fromkeys(
-        a['href'] for a in soup.find_all('a', href=True)
-        if 'downloadwella.com' in a['href']
-    ))
-    print(f"[*] Found {len(links)} episode(s) — saving to: {folder}")
-    summary = DownloadSummary()
-    for i, ep_url in enumerate(links, 1):
-        ep_name = ep_url.split('/')[-1].replace('.html', '')
-        print(f"\n[{i}/{len(links)}] {ep_name}")
-        direct = resolve_downloadwella(ep_url, session)
-        if direct:
-            ext = 'mkv' if '.mkv' in direct else 'mp4'
-            download_file(direct, folder, safe_filename(f"{ep_name}.{ext}"), summary)
-        else:
-            print(f"  [✗] Could not extract link")
-            summary.failed += 1
-        time.sleep(1)
-    summary.report()
+    def cleaner(s):
+        s = re.sub(r'-s\d+.*$', '', s, flags=re.IGNORECASE)
+        s = re.sub(r'-(season|episode|complete).*$', '', s, flags=re.IGNORECASE)
+        return s
+    _extract_downloadwella_site(url, session, site_label='DramaKey.com', name_cleaner=cleaner)
 
 def extract_9jarocks(url, session):
     print("[*] 9jaRocks mode")
@@ -811,6 +808,264 @@ def extract_dramarain(url, session):
     print(f"[!] No download links found. Page has {len(all_links)} total links.")
     print(f"[!] Sample: {all_links[:5]}")
 
+# ─── PLUTOMOVIES EXTRACTOR ────────────────────────────────────
+
+def pluto_get_seasons(url, session):
+    """Get all season URLs from a PlutoMovies series page."""
+    r = safe_get(session, url, referer=PLUTO_BASE, timeout=30)
+    if not r:
+        return []
+    soup = BeautifulSoup(r.text, 'html.parser')
+    seasons = []
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        text = a.text.strip()
+        if '-season-' in href.lower() and '#disqus' not in href:
+            full_url = href if href.startswith('http') else PLUTO_BASE + href
+            name = text if text else href.split('/')[-1].replace('-', ' ').title()
+            if not any(s['url'] == full_url for s in seasons):
+                seasons.append({'name': name, 'url': full_url})
+    return seasons
+
+def pluto_get_episodes(season_url, session):
+    """Get all episode URLs from a season page, handling pagination."""
+    all_episodes = {}
+    current_page = 1
+    while True:
+        page_url = season_url if current_page == 1 else f"{season_url}/page/{current_page}"
+        r = safe_get(session, page_url, referer=season_url, timeout=30)
+        if not r or r.status_code != 200:
+            break
+        soup = BeautifulSoup(r.text, 'html.parser')
+        found = 0
+        for a in soup.find_all('a', href=True):
+            href  = a['href']
+            text  = a.text.strip()
+            img   = a.find('img')
+            alt   = img.get('alt', '') if img else ''
+            zone  = f"{text} {alt} {href}"
+            if not EP_REGEX.search(zone):
+                continue
+            # Fix 4: corrected skip logic — skip season links OR irrelevant paths
+            if any(x in href.lower() for x in ['/genre/', '/year/', '/tag/', '#disqus']):
+                continue
+            if '-season-' in href.lower() and '/page/' not in href.lower():
+                continue
+            full_url = href if href.startswith('http') else PLUTO_BASE + href
+            if full_url not in all_episodes:
+                ep_title = text or alt or href.split('/')[-1].replace('-', ' ').title()
+                all_episodes[full_url] = ep_title
+                found += 1
+        if found == 0:
+            break
+        current_page += 1
+        time.sleep(0.5)
+    return all_episodes
+
+def pluto_get_download_link(ep_url, session):
+    """Extract direct download link from a PlutoMovies episode page."""
+    r = safe_get(session, ep_url, referer=PLUTO_BASE, timeout=30)
+    if not r:
+        return None
+    soup = BeautifulSoup(r.text, 'html.parser')
+
+    # Priority 1: direct video file links
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        if href.endswith(('.mp4', '.mkv', '.avi')):
+            return href if href.startswith('http') else PLUTO_BASE + href
+
+    # Priority 2: download links — skip app/extension/unsupported hosts
+    # Fix 3: tighter matching to avoid "Download App" type buttons
+    SKIP_HOSTS   = ['drive.google', 'mega.nz', 'play.google', 'apps.apple']
+    SKIP_PHRASES = ['app', 'extension', 'plugin', 'browser', 'apk']
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        text = a.text.lower().strip()
+        if 'download' not in text:
+            continue
+        if not href.startswith('http'):
+            continue
+        if any(h in href for h in SKIP_HOSTS):
+            print(f"  [!] Skipping unsupported host: {href[:60]}")
+            continue
+        if any(p in text for p in SKIP_PHRASES):
+            continue
+        return href
+
+    # Priority 3: scan page source for direct video URL
+    return find_direct_video(r.text)
+
+def extract_plutomovies(url, session):
+    print("[*] PlutoMovies mode")
+    slug = url.rstrip('/').split('/')[-1]
+    name = re.sub(r'-\d{4}(-tv)?$', '', slug)
+    name = clean_name(name)
+    print(f"[*] Title: {name}")
+    folder = os.path.join(BASE_DIR, safe_filename(name))
+    summary = DownloadSummary()
+
+    seasons = pluto_get_seasons(url, session)
+
+    if seasons:
+        print(f"[*] Found {len(seasons)} season(s)")
+        for season in seasons:
+            print(f"\n[*] Season: {season['name']}")
+            episodes = pluto_get_episodes(season['url'], session)
+            if not episodes:
+                print(f"  [!] No episodes found for {season['name']}")
+                continue
+            print(f"  [*] Found {len(episodes)} episode(s)")
+            ep_list = list(episodes.items())
+            for i, (ep_url, ep_title) in enumerate(ep_list, 1):
+                print(f"\n  [{i}/{len(ep_list)}] {ep_title}")
+                direct = pluto_get_download_link(ep_url, session)
+                if direct:
+                    ext = 'mkv' if '.mkv' in direct else 'mp4'
+                    fname = safe_filename(f"{ep_title}.{ext}")
+                    download_file(direct, folder, fname, summary)
+                else:
+                    print(f"  [✗] No download link found")
+                    summary.failed += 1
+                time.sleep(1)
+    else:
+        print("[*] Treating as single movie/episode")
+        direct = pluto_get_download_link(url, session)
+        if direct:
+            ext = 'mkv' if '.mkv' in direct else 'mp4'
+            fname = safe_filename(f"{name}.{ext}")
+            download_file(direct, folder, fname, summary)
+        else:
+            print("[✗] No download link found")
+            summary.failed += 1
+
+    summary.report()
+
+# ─── NAIJAVAULT + VIKINGFILE EXTRACTOR ───────────────────────
+
+def resolve_vikingfile(viking_url, session):
+    """
+    Multi-hop referrer spoof to extract CDN link with md5 hash.
+    Fix 7: uses safe_get with retries on both hops.
+    Fix 1: uses resolve_relative_url to safely handle relative redirects.
+    """
+    try:
+        # Hop 1: simulate coming from NaijaVault
+        r1 = safe_get(session, viking_url, referer='https://www.naijavault.com/',
+                      timeout=15, retries=3)
+        if not r1:
+            print(f"  [!] VikingFile: hop 1 request failed")
+            return None
+        # Handle both redirect response and direct response
+        if r1.status_code in (301, 302, 303, 307, 308):
+            loc1 = resolve_relative_url(viking_url, r1.headers.get('location'))
+        else:
+            # Some hosts don't redirect, they serve landing page directly
+            loc1 = viking_url
+
+        if not loc1:
+            print(f"  [!] VikingFile: could not resolve hop 1 location")
+            return None
+
+        # Hop 2: simulate coming from VikingFile landing page
+        r2 = safe_get(session, loc1, referer=viking_url, timeout=15, retries=3)
+        if not r2:
+            print(f"  [!] VikingFile: hop 2 request failed")
+            return None
+
+        if r2.status_code in (301, 302, 303, 307, 308):
+            loc2 = resolve_relative_url(loc1, r2.headers.get('location'))
+            if loc2:
+                if 'md5=' not in loc2:
+                    print(f"  [!] Warning: hotlink block may have triggered")
+                return loc2
+
+        # If no redirect, try to find direct video in response
+        v = find_direct_video(r2.text)
+        if v:
+            return v
+
+        return loc1
+
+    except Exception as e:
+        print(f"  [!] VikingFile resolve error: {e}")
+        return None
+
+def extract_viking_url(gw_url, session):
+    """Extract VikingFile URL from NaijaVault gateway /dl- page.
+    Fix 8: uses safe_get with retries instead of raw session.get."""
+    try:
+        r = safe_get(session, gw_url, referer='https://www.naijavault.com/',
+                     timeout=15, retries=3)
+        if not r:
+            return None
+        m = re.search(r'(https?://vikingfile\.com/[fd]/[^\s"\'<>]+)', r.text)
+        if m:
+            return m.group(1)
+    except Exception as e:
+        print(f"  [!] Gateway error: {e}")
+    return None
+
+def extract_naijavault(url, session):
+    print("[*] NaijaVault mode")
+    slug = url.rstrip('/').split('/')[-1]
+    name = re.sub(r'-\d{4}.*$', '', slug)
+    name = re.sub(r'-season-\d+.*$', '', name, flags=re.IGNORECASE)
+    name = clean_name(name)
+    print(f"[*] Title: {name}")
+    folder = os.path.join(BASE_DIR, safe_filename(name))
+
+    r = safe_get(session, url, referer='https://www.naijavault.com/', timeout=30)
+    if not r:
+        return
+    soup = BeautifulSoup(r.text, 'html.parser')
+
+    # Fix 2: use set for O(1) deduplication instead of O(n²) linear search
+    seen_hrefs = set()
+    episodes = []
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        if ('/dl-' in href or 'vikingfile.com' in href) and href not in seen_hrefs:
+            seen_hrefs.add(href)
+            # Fix 10: clean raw episode name before using as filename
+            raw_name = a.get_text(strip=True) or f"episode-{len(episodes)+1}"
+            ep_name  = clean_ep_name(raw_name) or f"episode-{len(episodes)+1}"
+            episodes.append({'name': ep_name, 'href': href})
+
+    if not episodes:
+        print("[!] No episode links found")
+        return
+
+    print(f"[*] Found {len(episodes)} episode(s) — saving to: {folder}")
+    summary = DownloadSummary()
+
+    for i, ep in enumerate(episodes, 1):
+        ep_name = safe_filename(ep['name'] or f"episode-{i}")
+        print(f"\n[{i}/{len(episodes)}] {ep_name}")
+
+        if '/dl-' in ep['href']:
+            viking_url = extract_viking_url(ep['href'], session)
+        else:
+            viking_url = ep['href']
+
+        if not viking_url:
+            print(f"  [✗] Could not find VikingFile URL")
+            summary.failed += 1
+            continue
+
+        cdn_url = resolve_vikingfile(viking_url, session)
+        if not cdn_url:
+            print(f"  [✗] Could not resolve CDN link")
+            summary.failed += 1
+            continue
+
+        print(f"  [✓] CDN link resolved")
+        ext = 'mkv' if '.mkv' in cdn_url else 'mp4'
+        download_file(cdn_url, folder, safe_filename(f"{ep_name}.{ext}"), summary)
+        time.sleep(1)
+
+    summary.report()
+
 # ─── SITE DETECTION ───────────────────────────────────────────
 SITE_MAP = {
     'thenkiri.com':      extract_nkiri,
@@ -822,6 +1077,8 @@ SITE_MAP = {
     'naijaprey.tv':      extract_naijaprey,
     'myasiantv9.com.ro': extract_myasiantv,
     'myasiantv9.com':    extract_myasiantv,
+    'plutomovies.com':   extract_plutomovies,
+    'naijavault.com':    extract_naijavault,
 }
 
 def detect_site(url):
@@ -841,7 +1098,6 @@ def main():
         if not extractor:
             print(f"[!] Unsupported site: {url}")
             sys.exit(1)
-        # Fix 7: wrap extractor call in try/except
         try:
             extractor(url, session)
         except Exception as e:
@@ -877,7 +1133,6 @@ def main():
         if not extractor:
             print(f"[!] Unsupported site. Supported: {', '.join(SITE_MAP.keys())}")
             continue
-        # Fix 7: wrap extractor call in try/except
         try:
             extractor(url, session)
         except Exception as e:
