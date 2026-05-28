@@ -961,10 +961,9 @@ def extract_plutomovies(url, session):
                 print(f"\n  [{i}/{len(ep_list)}] {ep_title}")
                 direct = pluto_get_download_link(ep_url, session)
                 if direct:
-                    fname = safe_filename(f"{ep_title}.mp4")
-                    # All PlutoMovies links go through yt-dlp
-                    # dl.plutomovies.com is JS-rendered, yt-dlp handles it
-                    download_with_ytdlp(direct, folder, fname, summary)
+                    ext = 'mkv' if 'mkv' in direct.lower() else 'mp4'
+                    fname = safe_filename(f"{ep_title}.{ext}")
+                    download_file(direct, folder, fname, summary)
                 else:
                     print(f"  [✗] No download link found")
                     summary.failed += 1
@@ -973,8 +972,9 @@ def extract_plutomovies(url, session):
         print("[*] Treating as single movie/episode")
         direct = pluto_get_download_link(url, session)
         if direct:
-            fname = safe_filename(f"{name}.mp4")
-            download_with_ytdlp(direct, folder, fname, summary)
+            ext = 'mkv' if 'mkv' in direct.lower() else 'mp4'
+            fname = safe_filename(f"{name}.{ext}")
+            download_file(direct, folder, fname, summary)
         else:
             print("[✗] No download link found")
             summary.failed += 1
@@ -983,37 +983,24 @@ def extract_plutomovies(url, session):
 
 # ─── NAIJAVAULT + VIKINGFILE EXTRACTOR ───────────────────────
 
-def resolve_vikingfile(viking_url, session):
+def resolve_vikingfile(url, session):
     """
-    Multi-hop referrer spoof to extract CDN link with md5 hash.
-    Uses stateful session header updates between hops — this is critical.
-    urljoin handles relative redirects properly.
-    Matches the working reference implementation exactly.
+    Resolve vikingfile.com URL to direct CDN download link.
+    Two-hop redirect chain:
+    Hop 1: vikingfile.com/f/{code} → vikingfile.com/d/{code2}/{filename}
+    Hop 2: vikingfile.com/d/{code2}/{filename} → lp.vikingfile.com/download/...?md5=...
+    Referer must be naijavault.com throughout.
     """
-    from urllib.parse import urljoin
     try:
-        # Hop 1: Request with NaijaVault as referer
-        # IMPORTANT: update session headers directly so state carries over
         session.headers.update({'Referer': 'https://www.naijavault.com/'})
-        r1 = session.get(viking_url, timeout=15, allow_redirects=False)
+        r1 = session.get(url, timeout=15, allow_redirects=False)
         loc1 = r1.headers.get('location')
         if not loc1:
             print(f"  [!] VikingFile: no redirect on hop 1")
             return None
-        loc1 = urljoin(viking_url, loc1)
-
-        # Hop 2: Request with VikingFile landing page as referer
-        # IMPORTANT: update to the specific viking URL — this bypasses hotlink mitigation
-        session.headers.update({'Referer': viking_url})
         r2 = session.get(loc1, timeout=15, allow_redirects=False)
         loc2 = r2.headers.get('location')
-        if loc2:
-            final = urljoin(loc1, loc2)
-            if 'md5=' not in final:
-                print(f"  [!] Warning: hotlink block may have triggered")
-            return final
-        return loc1
-
+        return loc2 if loc2 else loc1
     except Exception as e:
         print(f"  [!] VikingFile resolve error: {e}")
         return None
