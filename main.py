@@ -912,43 +912,28 @@ def pluto_get_episodes(season_url, session):
     return all_episodes
 
 def pluto_get_download_link(ep_url, session):
-    """Extract direct download link from a PlutoMovies episode page."""
+    """
+    Extract the dl.plutomovies.com link from episode page.
+    This link is passed directly to yt-dlp which handles the JS rendering.
+    """
     r = safe_get(session, ep_url, referer=PLUTO_BASE, timeout=30)
     if not r:
         return None
     soup = BeautifulSoup(r.text, 'html.parser')
 
-    SKIP_HOSTS   = ['drive.google', 'mega.nz', 'play.google', 'apps.apple']
-    SKIP_PHRASES = ['app', 'extension', 'plugin', 'browser', 'apk']
-
-    # Priority 1: dl.plutomovies.com links — this is the main download CDN
+    # Priority 1: dl.plutomovies.com — pass directly to yt-dlp
     for a in soup.find_all('a', href=True):
         href = a['href']
         if 'dl.plutomovies.com' in href:
             return href if href.startswith('http') else PLUTO_BASE + href
 
-    # Priority 2: direct video file extension links
+    # Priority 2: direct video file links
     for a in soup.find_all('a', href=True):
         href = a['href']
         if href.endswith(('.mp4', '.mkv', '.avi')):
             return href if href.startswith('http') else PLUTO_BASE + href
 
-    # Priority 3: any link with "download" in text, skip noise
-    for a in soup.find_all('a', href=True):
-        href = a['href']
-        text = a.text.lower().strip()
-        if 'download' not in text:
-            continue
-        if not href.startswith('http'):
-            continue
-        if any(h in href for h in SKIP_HOSTS):
-            print(f"  [!] Skipping unsupported host: {href[:60]}")
-            continue
-        if any(p in text for p in SKIP_PHRASES):
-            continue
-        return href
-
-    # Priority 4: scan page source for direct video URL
+    # Last resort: scan page source
     return find_direct_video(r.text)
 
 def extract_plutomovies(url, session):
@@ -976,9 +961,10 @@ def extract_plutomovies(url, session):
                 print(f"\n  [{i}/{len(ep_list)}] {ep_title}")
                 direct = pluto_get_download_link(ep_url, session)
                 if direct:
-                    ext = 'mkv' if '.mkv' in direct else 'mp4'
-                    fname = safe_filename(f"{ep_title}.{ext}")
-                    download_file(direct, folder, fname, summary)
+                    fname = safe_filename(f"{ep_title}.mp4")
+                    # All PlutoMovies links go through yt-dlp
+                    # dl.plutomovies.com is JS-rendered, yt-dlp handles it
+                    download_with_ytdlp(direct, folder, fname, summary)
                 else:
                     print(f"  [✗] No download link found")
                     summary.failed += 1
@@ -987,9 +973,8 @@ def extract_plutomovies(url, session):
         print("[*] Treating as single movie/episode")
         direct = pluto_get_download_link(url, session)
         if direct:
-            ext = 'mkv' if '.mkv' in direct else 'mp4'
-            fname = safe_filename(f"{name}.{ext}")
-            download_file(direct, folder, fname, summary)
+            fname = safe_filename(f"{name}.mp4")
+            download_with_ytdlp(direct, folder, fname, summary)
         else:
             print("[✗] No download link found")
             summary.failed += 1
@@ -1001,45 +986,32 @@ def extract_plutomovies(url, session):
 def resolve_vikingfile(viking_url, session):
     """
     Multi-hop referrer spoof to extract CDN link with md5 hash.
-    Fix 7: uses safe_get with retries on both hops.
-    Fix 1: uses resolve_relative_url to safely handle relative redirects.
+    Uses stateful session header updates between hops — this is critical.
+    urljoin handles relative redirects properly.
+    Matches the working reference implementation exactly.
     """
+    from urllib.parse import urljoin
     try:
-        # Hop 1: simulate coming from NaijaVault
-        r1 = safe_get(session, viking_url, referer='https://www.naijavault.com/',
-                      timeout=15, retries=3)
-        if not r1:
-            print(f"  [!] VikingFile: hop 1 request failed")
-            return None
-        # Handle both redirect response and direct response
-        if r1.status_code in (301, 302, 303, 307, 308):
-            loc1 = resolve_relative_url(viking_url, r1.headers.get('location'))
-        else:
-            # Some hosts don't redirect, they serve landing page directly
-            loc1 = viking_url
-
+        # Hop 1: Request with NaijaVault as referer
+        # IMPORTANT: update session headers directly so state carries over
+        session.headers.update({'Referer': 'https://www.naijavault.com/'})
+        r1 = session.get(viking_url, timeout=15, allow_redirects=False)
+        loc1 = r1.headers.get('location')
         if not loc1:
-            print(f"  [!] VikingFile: could not resolve hop 1 location")
+            print(f"  [!] VikingFile: no redirect on hop 1")
             return None
+        loc1 = urljoin(viking_url, loc1)
 
-        # Hop 2: simulate coming from VikingFile landing page
-        r2 = safe_get(session, loc1, referer=viking_url, timeout=15, retries=3)
-        if not r2:
-            print(f"  [!] VikingFile: hop 2 request failed")
-            return None
-
-        if r2.status_code in (301, 302, 303, 307, 308):
-            loc2 = resolve_relative_url(loc1, r2.headers.get('location'))
-            if loc2:
-                if 'md5=' not in loc2:
-                    print(f"  [!] Warning: hotlink block may have triggered")
-                return loc2
-
-        # If no redirect, try to find direct video in response
-        v = find_direct_video(r2.text)
-        if v:
-            return v
-
+        # Hop 2: Request with VikingFile landing page as referer
+        # IMPORTANT: update to the specific viking URL — this bypasses hotlink mitigation
+        session.headers.update({'Referer': viking_url})
+        r2 = session.get(loc1, timeout=15, allow_redirects=False)
+        loc2 = r2.headers.get('location')
+        if loc2:
+            final = urljoin(loc1, loc2)
+            if 'md5=' not in final:
+                print(f"  [!] Warning: hotlink block may have triggered")
+            return final
         return loc1
 
     except Exception as e:
