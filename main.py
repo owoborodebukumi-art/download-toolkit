@@ -811,11 +811,29 @@ def extract_dramarain(url, session):
 # ─── PLUTOMOVIES EXTRACTOR ────────────────────────────────────
 
 def pluto_get_seasons(url, session):
-    """Get all season URLs from a PlutoMovies series page."""
+    """
+    Get season URLs from PlutoMovies.
+    Two structures:
+    1. Main series page links to season pages
+    2. URL itself IS already a season page with episodes
+    """
     r = safe_get(session, url, referer=PLUTO_BASE, timeout=30)
     if not r:
         return []
     soup = BeautifulSoup(r.text, 'html.parser')
+
+    # Detect if this page already has episode links (s04e01 pattern)
+    ep_links_on_page = [
+        a['href'] for a in soup.find_all('a', href=True)
+        if re.search(r'/series/\d+/[^"]+[Ss]\d{2}[Ee]\d{2}', a['href'])
+        and '#disqus' not in a['href']
+    ]
+    if ep_links_on_page:
+        slug = url.rstrip('/').split('/')[-1]
+        name = slug.replace('-', ' ').title()
+        return [{'name': name, 'url': url}]
+
+    # Otherwise find season links on main series page
     seasons = []
     for a in soup.find_all('a', href=True):
         href = a['href']
@@ -869,16 +887,22 @@ def pluto_get_download_link(ep_url, session):
         return None
     soup = BeautifulSoup(r.text, 'html.parser')
 
-    # Priority 1: direct video file links
+    SKIP_HOSTS   = ['drive.google', 'mega.nz', 'play.google', 'apps.apple']
+    SKIP_PHRASES = ['app', 'extension', 'plugin', 'browser', 'apk']
+
+    # Priority 1: dl.plutomovies.com links — this is the main download CDN
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        if 'dl.plutomovies.com' in href:
+            return href if href.startswith('http') else PLUTO_BASE + href
+
+    # Priority 2: direct video file extension links
     for a in soup.find_all('a', href=True):
         href = a['href']
         if href.endswith(('.mp4', '.mkv', '.avi')):
             return href if href.startswith('http') else PLUTO_BASE + href
 
-    # Priority 2: download links — skip app/extension/unsupported hosts
-    # Fix 3: tighter matching to avoid "Download App" type buttons
-    SKIP_HOSTS   = ['drive.google', 'mega.nz', 'play.google', 'apps.apple']
-    SKIP_PHRASES = ['app', 'extension', 'plugin', 'browser', 'apk']
+    # Priority 3: any link with "download" in text, skip noise
     for a in soup.find_all('a', href=True):
         href = a['href']
         text = a.text.lower().strip()
@@ -893,7 +917,7 @@ def pluto_get_download_link(ep_url, session):
             continue
         return href
 
-    # Priority 3: scan page source for direct video URL
+    # Priority 4: scan page source for direct video URL
     return find_direct_video(r.text)
 
 def extract_plutomovies(url, session):
