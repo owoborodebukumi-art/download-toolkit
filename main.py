@@ -235,6 +235,14 @@ def already_downloaded(folder, filename):
                 return False, None
     return False, None
 
+def get_referer_for_url(url):
+    """Return the correct Referer header for a given download URL."""
+    if 'dl.plutomovies.com' in url:
+        return 'https://plutomovies.com/'
+    if 'vikingfile.com' in url or 'vkng' in url:
+        return 'https://vikingfile.com/'
+    return base_domain(url) + '/'
+
 def download_with_aria2c(url, folder, filename, summary):
     if not HAS_ARIA2C:
         if not install_aria2c():
@@ -244,6 +252,8 @@ def download_with_aria2c(url, folder, filename, summary):
     os.makedirs(folder, exist_ok=True)
     safe_fname = re.sub(r'[^\w]', '_', filename)[:30]
     session_file = os.path.join(folder, f'.aria2_{safe_fname}.txt')
+    filepath = os.path.join(folder, filename)
+    referer = get_referer_for_url(url)
 
     print(f"  [↓] aria2c: {filename}")
     try:
@@ -260,14 +270,30 @@ def download_with_aria2c(url, folder, filename, summary):
             '-x', '4',
             '-s', '4',
             '--user-agent', UA_DESKTOP,
-            '--referer', base_domain(url) + '/',
+            '--referer', referer,
             '-d', folder,
             '-o', filename,
             url
         ]
         result = subprocess.run(cmd)
         if result.returncode == 0:
-            print(f"  [✓] Done: {filename}")
+            # Validate file after download — aria2c returns 0 even for HTML error pages
+            if os.path.exists(filepath):
+                size = os.path.getsize(filepath)
+                size_mb = size / (1024 * 1024)
+                if size < 1024 * 100:  # less than 100KB = HTML error page
+                    print(f"  [✗] Downloaded file is only {size_mb:.2f}MB — likely an error page")
+                    try:
+                        os.remove(filepath)
+                    except Exception:
+                        pass
+                    summary.failed += 1
+                    return False
+                print(f"  [✓] Done: {filename} ({size_mb:.1f}MB)")
+            else:
+                print(f"  [✗] File not found after download")
+                summary.failed += 1
+                return False
             try:
                 if os.path.exists(session_file):
                     os.remove(session_file)
@@ -846,9 +872,16 @@ def pluto_get_seasons(url, session):
     return seasons
 
 def pluto_get_episodes(season_url, session):
-    """Get all episode URLs from a season page, handling pagination."""
+    """
+    Get all episode URLs from a PlutoMovies season page, handling pagination.
+    Episode links follow the pattern: /series/XXXXXX/show-name-s04e01
+    We match on URL pattern directly instead of link text (text is often empty).
+    """
     all_episodes = {}
     current_page = 1
+    # Pattern matches PlutoMovies episode URLs: /series/123456/show-sXXeXX
+    ep_url_pattern = re.compile(r'/series/\d+/[^"#]+[Ss]\d{2}[Ee]\d{2}', re.IGNORECASE)
+
     while True:
         page_url = season_url if current_page == 1 else f"{season_url}/page/{current_page}"
         r = safe_get(session, page_url, referer=season_url, timeout=30)
@@ -857,21 +890,19 @@ def pluto_get_episodes(season_url, session):
         soup = BeautifulSoup(r.text, 'html.parser')
         found = 0
         for a in soup.find_all('a', href=True):
-            href  = a['href']
-            text  = a.text.strip()
-            img   = a.find('img')
-            alt   = img.get('alt', '') if img else ''
-            zone  = f"{text} {alt} {href}"
-            if not EP_REGEX.search(zone):
+            href = a['href']
+            # Skip non-episode links
+            if '#disqus' in href or '/page/' in href:
                 continue
-            # Fix 4: corrected skip logic — skip season links OR irrelevant paths
-            if any(x in href.lower() for x in ['/genre/', '/year/', '/tag/', '#disqus']):
-                continue
-            if '-season-' in href.lower() and '/page/' not in href.lower():
+            if not ep_url_pattern.search(href):
                 continue
             full_url = href if href.startswith('http') else PLUTO_BASE + href
             if full_url not in all_episodes:
-                ep_title = text or alt or href.split('/')[-1].replace('-', ' ').title()
+                # Get title from img alt or link text, fall back to URL slug
+                img = a.find('img')
+                alt = img.get('alt', '').strip() if img else ''
+                text = a.get_text(strip=True)
+                ep_title = alt or text or href.split('/')[-1].replace('-', ' ').title()
                 all_episodes[full_url] = ep_title
                 found += 1
         if found == 0:
