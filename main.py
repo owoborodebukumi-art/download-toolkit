@@ -1157,6 +1157,335 @@ if __name__ == '__main__':
     main()# ─── PLUTOMOVIES EXTRACTOR ────────────────────────────────────────
 from urllib.parse import urljoin as _urljoin
 
+PLUTO_BASE   = 'https://plutomovies.com'
+EP_KEYWORDS  = ['-e', 'episode', 's0', 's1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9']
+
+def resolve_plutomovies_dl(dl_url, session):
+    """
+    Fetch dl.plutomovies.com page and extract kissorgrab.com direct link
+    from downloadButton onclick JS.
+    Pattern: location.href = 'https://nv1e.kissorgrab.com/dl/{token}'
+    """
+    try:
+        session.headers.update({'Referer': PLUTO_BASE + '/'})
+        r = session.get(dl_url, timeout=15)
+        if not r:
+            return None
+        m = re.search(
+            r"getElementById\('downloadButton'\)\.onclick\s*=\s*function\(\)\s*\{"
+            r"\s*location\.href\s*=\s*'(https://[^']+)'",
+            r.text, re.DOTALL
+        )
+        if m:
+            return m.group(1)
+        return None
+    except Exception as e:
+        print(f"  [!] PlutoMovies DL: {e}")
+        return None
+
+def extract_plutomovies(url, session):
+    print("[*] PlutoMovies mode")
+    from urllib.parse import urljoin
+
+    is_movie = '/movie/' in url
+    slug = url.rstrip('/').split('/')[-1]
+    name = re.sub(r'-\d{4}.*$', '', slug).replace('-', ' ').title()
+    print(f"[*] Title: {name}")
+    folder = os.path.join(BASE_DIR, safe_filename(name))
+    summary = DownloadSummary()
+
+    session.headers.update({'Referer': PLUTO_BASE + '/'})
+    r = safe_get(session, url, timeout=30)
+    if not r:
+        return
+
+    soup = BeautifulSoup(r.text, 'html.parser')
+
+    # Direct fallback for Movies or isolated Episode URLs
+    dl_link = next((a['href'] for a in soup.find_all('a', href=True)
+                   if 'dl.plutomovies.com' in a['href']), None)
+
+    if is_movie or dl_link:
+        if dl_link:
+            print(f"[*] Direct link found — saving to: {folder}")
+            direct = resolve_plutomovies_dl(dl_link, session)
+            if direct:
+                ext = 'mkv' if 'mkv' in direct.lower() else 'mp4'
+                fname = safe_filename(f"{name}.{ext}")
+                download_file(direct, folder, fname, summary)
+            else:
+                print("[✗] Could not resolve download link")
+                summary.failed += 1
+        else:
+            print("[✗] No download link found on page")
+            summary.failed += 1
+        summary.report()
+        return
+
+    # Series: find season links using urljoin for relative paths
+    season_links = []
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        if '/series/' in href and 'season' in href.lower():
+            full_url = urljoin(PLUTO_BASE, href)
+            if full_url != url and full_url not in season_links:
+                season_links.append(full_url)
+
+    if not season_links:
+        season_links = [url]
+
+    print(f"[*] Found {len(season_links)} season(s)")
+
+    for season_url in season_links:
+        print("\n[*] Season: " + season_url.split("/")[-1])
+        page = 1
+        seen_eps = set()
+
+        while True:
+            page_url = season_url if page == 1 else f"{season_url}/page/{page}"
+            r2 = safe_get(session, page_url, timeout=30)
+            if not r2 or r2.status_code == 404:
+                break
+
+            soup2 = BeautifulSoup(r2.text, 'html.parser')
+
+            # Find episode links — exactly as per documentation
+            ep_links = []
+            for a in soup2.find_all('a', href=True):
+                href = a['href']
+                if '/series/' not in href:
+                    continue
+                full_url = urljoin(PLUTO_BASE, href)
+                if full_url != season_url and full_url not in seen_eps:
+                    if any(x in href.lower() for x in EP_KEYWORDS):
+                        ep_links.append(full_url)
+
+            new_eps = list(dict.fromkeys(ep_links))
+            if not new_eps:
+                break
+
+            # Reverse to get chronological order (ep1 first)
+            new_eps.reverse()
+
+            # Add to seen AFTER reversing
+            for ep_url in new_eps:
+                seen_eps.add(ep_url)
+
+            print(f"  [*] Page {page}: {len(new_eps)} episode(s)")
+
+            for ep_url in new_eps:
+                ep_name = safe_filename(ep_url.rstrip('/').split('/')[-1])
+                count = summary.success + summary.failed + summary.skipped + 1
+                print(f"\n  [{count}] {ep_name}")
+
+                r3 = safe_get(session, ep_url, timeout=30)
+                if not r3:
+                    print(f"  [✗] Could not fetch episode page")
+                    summary.failed += 1
+                    continue
+
+                soup3 = BeautifulSoup(r3.text, 'html.parser')
+                dl_link = next((a['href'] for a in soup3.find_all('a', href=True)
+                               if 'dl.plutomovies.com' in a['href']), None)
+
+                if not dl_link:
+                    print(f"  [✗] No download link on episode page")
+                    summary.failed += 1
+                    continue
+
+                direct = resolve_plutomovies_dl(dl_link, session)
+                if direct:
+                    ext = 'mkv' if 'mkv' in direct.lower() else 'mp4'
+                    fname = safe_filename(f"{ep_name}.{ext}")
+                    download_file(direct, folder, fname, summary)
+                else:
+                    print(f"  [✗] Could not resolve download link")
+                    summary.failed += 1
+
+                time.sleep(1)
+
+            page += 1
+            time.sleep(1)
+
+    summary.report()
+
+# ─── NAIJAVAULT + VIKINGFILE EXTRACTOR ───────────────────────
+# ─── NAIJAVAULT + VIKINGFILE EXTRACTOR ───────────────────────
+
+def resolve_vikingfile(url, session):
+    """
+    Resolve vikingfile.com URL to direct CDN download link.
+    Two-hop redirect chain:
+    Hop 1: vikingfile.com/f/{code} → vikingfile.com/d/{code2}/{filename}
+    Hop 2: vikingfile.com/d/{code2}/{filename} → lp.vikingfile.com/download/...?md5=...
+    Referer must be naijavault.com throughout.
+    """
+    try:
+        session.headers.update({'Referer': 'https://www.naijavault.com/'})
+        r1 = session.get(url, timeout=15, allow_redirects=False)
+        loc1 = r1.headers.get('location')
+        if not loc1:
+            print(f"  [!] VikingFile: no redirect on hop 1")
+            return None
+        r2 = session.get(loc1, timeout=15, allow_redirects=False)
+        loc2 = r2.headers.get('location')
+        return loc2 if loc2 else loc1
+    except Exception as e:
+        print(f"  [!] VikingFile resolve error: {e}")
+        return None
+
+def extract_viking_url(gw_url, session):
+    """Extract VikingFile URL from NaijaVault gateway /dl- page.
+    Fix 8: uses safe_get with retries instead of raw session.get."""
+    try:
+        r = safe_get(session, gw_url, referer='https://www.naijavault.com/',
+                     timeout=15, retries=3)
+        if not r:
+            return None
+        m = re.search(r'(https?://vikingfile\.com/[fd]/[^\s"\'<>]+)', r.text)
+        if m:
+            return m.group(1)
+    except Exception as e:
+        print(f"  [!] Gateway error: {e}")
+    return None
+
+def extract_naijavault(url, session):
+    print("[*] NaijaVault mode")
+    slug = url.rstrip('/').split('/')[-1]
+    name = re.sub(r'-\d{4}.*$', '', slug)
+    name = re.sub(r'-season-\d+.*$', '', name, flags=re.IGNORECASE)
+    name = clean_name(name)
+    print(f"[*] Title: {name}")
+    folder = os.path.join(BASE_DIR, safe_filename(name))
+
+    r = safe_get(session, url, referer='https://www.naijavault.com/', timeout=30)
+    if not r:
+        return
+    soup = BeautifulSoup(r.text, 'html.parser')
+
+    # Fix 2: use set for O(1) deduplication instead of O(n²) linear search
+    seen_hrefs = set()
+    episodes = []
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        if ('/dl-' in href or 'vikingfile.com' in href) and href not in seen_hrefs:
+            seen_hrefs.add(href)
+            # Fix 10: clean raw episode name before using as filename
+            raw_name = a.get_text(strip=True) or f"episode-{len(episodes)+1}"
+            ep_name  = clean_ep_name(raw_name) or f"episode-{len(episodes)+1}"
+            episodes.append({'name': ep_name, 'href': href})
+
+    if not episodes:
+        print("[!] No episode links found")
+        return
+
+    print(f"[*] Found {len(episodes)} episode(s) — saving to: {folder}")
+    summary = DownloadSummary()
+
+    for i, ep in enumerate(episodes, 1):
+        ep_name = safe_filename(ep['name'] or f"episode-{i}")
+        print(f"\n[{i}/{len(episodes)}] {ep_name}")
+
+        if '/dl-' in ep['href']:
+            viking_url = extract_viking_url(ep['href'], session)
+        else:
+            viking_url = ep['href']
+
+        if not viking_url:
+            print(f"  [✗] Could not find VikingFile URL")
+            summary.failed += 1
+            continue
+
+        cdn_url = resolve_vikingfile(viking_url, session)
+        if not cdn_url:
+            print(f"  [✗] Could not resolve CDN link")
+            summary.failed += 1
+            continue
+
+        print(f"  [✓] CDN link resolved")
+        ext = 'mkv' if '.mkv' in cdn_url else 'mp4'
+        download_file(cdn_url, folder, safe_filename(f"{ep_name}.{ext}"), summary)
+        time.sleep(1)
+
+    summary.report()
+
+# ─── SITE DETECTION ───────────────────────────────────────────
+SITE_MAP = {
+    'thenkiri.com':      extract_nkiri,
+    'nkiri.com':         extract_nkiri,
+    'dramakey.com':      extract_dramakey_com,
+    'dramakey.cc':       extract_dramarain,
+    'dramarain.com':     extract_dramarain,
+    '9jarocks.net':      extract_9jarocks,
+    'naijaprey.tv':      extract_naijaprey,
+    'myasiantv9.com.ro': extract_myasiantv,
+    'myasiantv9.com':    extract_myasiantv,
+    'plutomovies.com':   extract_plutomovies,
+    'naijavault.com':    extract_naijavault,
+}
+
+def detect_site(url):
+    for domain, extractor in SITE_MAP.items():
+        if domain in url:
+            return extractor
+    return None
+
+# ─── MAIN ─────────────────────────────────────────────────────
+def main():
+    setup_android()
+    session = make_session()
+
+    if len(sys.argv) >= 2:
+        url = sys.argv[1].strip()
+        extractor = detect_site(url)
+        if not extractor:
+            print(f"[!] Unsupported site: {url}")
+            sys.exit(1)
+        try:
+            extractor(url, session)
+        except Exception as e:
+            print(f"\n[!] Unexpected error: {e}")
+            print("[!] Please check the URL and try again")
+        return
+
+    print("=" * 50)
+    print("  DOWNLOAD TOOLKIT")
+    print(f"  Saving to: {BASE_DIR}")
+    print("=" * 50)
+    print("Supported sites:")
+    for domain in SITE_MAP:
+        print(f"  • {domain}")
+    print("\nPaste a link and press Enter | 'exit' to quit")
+
+    while True:
+        print("\n> Paste link:")
+        try:
+            url = input().strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye!")
+            break
+        if not url:
+            continue
+        if url.lower() == 'exit':
+            print("Bye!")
+            break
+        if not url.startswith('http'):
+            print("[!] That doesn't look like a URL. Paste a full link starting with http")
+            continue
+        extractor = detect_site(url)
+        if not extractor:
+            print(f"[!] Unsupported site. Supported: {', '.join(SITE_MAP.keys())}")
+            continue
+        try:
+            extractor(url, session)
+        except Exception as e:
+            print(f"\n[!] Unexpected error: {e}")
+            print("[!] Please check the URL and try again")
+
+if __name__ == '__main__':
+    main()# ─── PLUTOMOVIES EXTRACTOR ────────────────────────────────────────
+from urllib.parse import urljoin as _urljoin
+
 PLUTO_BASE  = 'https://plutomovies.com'
 EP_KEYWORDS = ['-e', 'episode', 's0', 's1', 's2', 's3', 's4', 's5', 's6', 's7', 's8', 's9']
 EP_REGEX    = re.compile(r'([Ss]\d{1,2}[Ee]\d{1,2}|[Ee]\d{1,2}|Episode\s*\d{1,2})', re.IGNORECASE)
@@ -1188,9 +1517,36 @@ def resolve_plutomovies_dl(dl_url, session):
         print(f"  [!] PlutoMovies DL: {e}")
         return None
 
+def make_pluto_session():
+    """PlutoMovies blocks standard requests with 403 — use curl_cffi to bypass."""
+    if HAS_CURL_CFFI:
+        s = cf_requests.Session(impersonate='chrome120')
+        s.headers.update({'Referer': PLUTO_BASE + '/'})
+        return s
+    print("[!] Warning: curl_cffi not installed — PlutoMovies may return 403")
+    print("[!] Install with: pip install curl_cffi --break-system-packages")
+    s = make_session()
+    s.headers.update({'Referer': PLUTO_BASE + '/'})
+    return s
+
+def pluto_get(session, url, timeout=30):
+    """Fetch a PlutoMovies page handling both curl_cffi and requests sessions."""
+    try:
+        r = session.get(url, timeout=timeout)
+        if r.status_code == 403:
+            print(f"  [!] 403 blocked by PlutoMovies — curl_cffi required")
+            return None
+        return r
+    except Exception as e:
+        print(f"  [!] PlutoMovies fetch error: {e}")
+        return None
+
 def extract_plutomovies(url, session):
     print("[*] PlutoMovies mode")
     from urllib.parse import urljoin
+
+    # PlutoMovies blocks standard requests — use curl_cffi session
+    pluto_session = make_pluto_session()
 
     is_movie = '/movie/' in url
     slug = url.rstrip('/').split('/')[-1]
@@ -1199,8 +1555,7 @@ def extract_plutomovies(url, session):
     folder = os.path.join(BASE_DIR, safe_filename(name))
     summary = DownloadSummary()
 
-    session.headers.update({'Referer': PLUTO_BASE + '/'})
-    r = safe_get(session, url, timeout=30)
+    r = pluto_get(pluto_session, url)
     if not r:
         return
 
