@@ -1226,7 +1226,7 @@ def extract_plutomovies(url, session):
     season_links = []
     for a in soup.find_all('a', href=True):
         href = a['href']
-        if '/series/' in href and 'season' in href.lower():
+        if '/series/' in href and 'season' in href.lower() and '#' not in href:
             full_url = urljoin(PLUTO_BASE, href)
             if full_url != url and full_url not in season_links:
                 season_links.append(full_url)
@@ -1587,7 +1587,7 @@ def extract_plutomovies(url, session):
     season_links = []
     for a in soup.find_all('a', href=True):
         href = a['href']
-        if '/series/' in href and 'season' in href.lower():
+        if '/series/' in href and 'season' in href.lower() and '#' not in href:
             full_url = urljoin(PLUTO_BASE, href)
             if full_url != url and full_url not in season_links:
                 season_links.append(full_url)
