@@ -1257,17 +1257,25 @@ def extract_plutomovies(url, session):
 
             soup2 = BeautifulSoup(r2.text, 'html.parser')
 
-            # Find episode links — match on keywords in href
-            # Use urljoin to handle relative paths
+            # Find episode links — must have /series/ AND episode pattern in slug
+            # Episode slugs look like: tracker-s01-e13, show-s02e04, etc
+            # Exclude: season links, disqus, trending sidebar links
             ep_links = []
             for a in soup2.find_all('a', href=True):
                 href = a['href']
                 if '/series/' not in href:
                     continue
+                if '#disqus' in href:
+                    continue
                 full_url = urljoin(PLUTO_BASE, href)
                 if full_url == season_url or full_url in seen_eps:
                     continue
-                if not any(x in href.lower() for x in EP_KEYWORDS):
+                # Must match episode pattern in the slug part only
+                slug_part = href.rstrip('/').split('/')[-1].lower()
+                if not any(x in slug_part for x in EP_KEYWORDS):
+                    continue
+                # Must NOT be a season page or series overview
+                if 'season' in slug_part and not any(x in slug_part for x in ['-e', 'episode']):
                     continue
                 ep_links.append(full_url)
 
